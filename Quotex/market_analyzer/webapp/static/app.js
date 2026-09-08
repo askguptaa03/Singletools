@@ -247,6 +247,16 @@ let _chartRegistry = new WeakMap();
 
 function renderCardChart(canvas, data) {
   if (!window.Chart || !canvas) return;
+
+  // Chart.js needs the canvas to be attached to the live DOM so it can
+  // calculate dimensions/styles correctly. Signal cards are cloned from
+  // a <template>, so the first render can happen while the canvas is still
+  // detached from the document.
+  if (!canvas.isConnected) {
+    requestAnimationFrame(() => renderCardChart(canvas, data));
+    return;
+  }
+
   const hist = (data && data.price_history) || [];
   if (hist.length < 2) { canvas.parentElement.style.display = 'none'; return; }
   canvas.parentElement.style.display = '';
