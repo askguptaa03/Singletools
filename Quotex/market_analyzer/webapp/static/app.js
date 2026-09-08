@@ -848,8 +848,7 @@ function initAssetGrid(gridId, searchId, hiddenId) {
     // completes, via the onLiveOtcAssetsChanged() listener registered below.
     const otcSyms = _liveOtcState.loaded ? _liveOtcState.assets : (window._OTC_ASSETS || []);
     const otcList = otcSyms.map((s) => ({ sym: s, group: 'OTC' }));
-    const liveList = (window._LIVE_ASSETS || []).map((s) => ({ sym: s, group: 'LIVE' }));
-    all = [...otcList, ...liveList];
+    all = otcList;
   }
 
   function render(q) {
