@@ -689,6 +689,36 @@ class AsyncQuotexClient:
                         # advertised as available and what's requested.
                         symbol = sanitize_symbol(symbol).replace("_OTC", "_otc")
 
+                        _tf_raw_present = (len(asset) > 12 and isinstance(asset[12], list)) or \
+                                          (len(asset) > 15 and isinstance(asset[15], list))
+                        _tf_parsed = sorted(set(
+                            [
+                                int(x[0]) for x in asset[12]
+                                if isinstance(asset[12], list)
+                                for x in ([x] if isinstance(x, (int, str)) else [x])
+                                if isinstance(x, (list, tuple)) and x
+                            ] + [
+                                int(x) for x in asset[12]
+                                if isinstance(asset[12], list) and isinstance(x, (int, str))
+                            ] + [
+                                int(obj.get("time"))
+                                for obj in (asset[15] or [])
+                                if len(asset) > 15 and isinstance(asset[15], list)
+                                for obj in ([obj] if isinstance(obj, dict) else [])
+                                if isinstance(obj.get("time", None), (int, str))
+                            ]
+                        )) if _tf_raw_present else []
+                        # "Confirmed" means the broker's raw asset row actually
+                        # carried a non-empty timeframe list we could parse —
+                        # NOT merely that the row had a list-shaped field.
+                        # Anything else (missing field, empty list, parse
+                        # yielded nothing) falls back to the full generic
+                        # list and is marked unconfirmed, so callers can tell
+                        # "broker said no" apart from "we don't actually know".
+                        _tf_confirmed = bool(_tf_parsed)
+                        _tf_list = _tf_parsed if _tf_confirmed else \
+                            [30, 60, 120, 180, 300, 600, 900, 1800, 2700, 3600, 7200, 10800, 14400]
+
                         assets[symbol] = {
                             "id": int(asset[0]) if len(asset) > 0 and asset[0] is not None else 0,
                             "name": str(asset[2]) if len(asset) > 2 else symbol,
@@ -696,27 +726,8 @@ class AsyncQuotexClient:
                             "payout": int(asset[5]) if len(asset) > 5 and asset[5] is not None else 0,
                             "is_otc": "_otc" in symbol.lower(),
                             "is_open": bool(asset[14]) if len(asset) > 14 and asset[14] is not None else False,
-                            "available_timeframes": (
-                                sorted(set(
-                                    [
-                                        int(x[0]) for x in asset[12]
-                                        if isinstance(asset[12], list)
-                                        for x in ([x] if isinstance(x, (int, str)) else [x])
-                                        if isinstance(x, (list, tuple)) and x
-                                    ] + [
-                                        int(x) for x in asset[12]
-                                        if isinstance(asset[12], list) and isinstance(x, (int, str))
-                                    ] + [
-                                        int(obj.get("time"))
-                                        for obj in (asset[15] or [])
-                                        if len(asset) > 15 and isinstance(asset[15], list)
-                                        for obj in ([obj] if isinstance(obj, dict) else [])
-                                        if isinstance(obj.get("time", None), (int, str))
-                                    ]
-                                ))
-                                if len(asset) > 12 and isinstance(asset[12], list) or (len(asset) > 15 and isinstance(asset[15], list))
-                                else [60, 120, 180, 300, 600, 900, 1800, 2700, 3600, 7200, 10800, 14400]
-                            ),
+                            "available_timeframes": _tf_list,
+                            "available_timeframes_confirmed": _tf_confirmed,
                         }
                     except Exception:
                         continue
@@ -888,7 +899,15 @@ class AsyncQuotexClient:
                                 if isinstance(obj, dict) and "time" in obj:
                                     tfs.append(int(obj["time"]))
 
-                        tfs = sorted(set(tfs)) if tfs else [60, 120, 180, 300, 600, 900, 1800, 2700, 3600, 7200, 10800, 14400]
+                        tfs = sorted(set(tfs))
+                        # "Confirmed" = the broker row actually yielded a
+                        # non-empty parsed timeframe list. Empty/missing
+                        # falls back to the generic list and is marked
+                        # unconfirmed (see get_available_assets() docstring
+                        # for why this distinction matters before gating).
+                        tfs_confirmed = bool(tfs)
+                        if not tfs_confirmed:
+                            tfs = [30, 60, 120, 180, 300, 600, 900, 1800, 2700, 3600, 7200, 10800, 14400]
 
                         parsed[symbol] = {
                             "id": int(row[0] or 0),
@@ -897,7 +916,8 @@ class AsyncQuotexClient:
                             "payout": payout,
                             "is_otc": "_otc" in symbol.lower(),
                             "is_open": is_open,
-                            "available_timeframes": tfs
+                            "available_timeframes": tfs,
+                            "available_timeframes_confirmed": tfs_confirmed,
                         }
                     except Exception:
                         continue
@@ -1091,13 +1111,19 @@ class AsyncQuotexClient:
         request_id = f"{asset}_{timeframe}"
         if self.enable_logging:
             logger.warning(f"[CANDLE-DEBUG] REQUEST start asset={asset} period={timeframe} count={count}")
-        # Reuse an in-flight future for the same rid (like Pocket Option)
+        # Reuse an in-flight future for the same rid (like Pocket Option).
+        # The shared future resolves with the FULL response for the first
+        # caller's request — each caller (this one included) still trims to
+        # its OWN requested `count`, so two callers sharing one in-flight
+        # request for the same (asset, timeframe) but different counts each
+        # get back the number of candles they actually asked for.
         fut = self._candle_requests.get(request_id)
         if fut and not fut.done():
             try:
-                return await asyncio.wait_for(fut, timeout=max(10.0, float(getattr(self._config.trading, "default_timeout", 10))))
+                shared_candles = await asyncio.wait_for(fut, timeout=max(10.0, float(getattr(self._config.trading, "default_timeout", 10))))
             except asyncio.TimeoutError:
                 return []
+            return shared_candles[-count:] if isinstance(shared_candles, list) and count else shared_candles
         candle_future: asyncio.Future = asyncio.get_event_loop().create_future()
         self._candle_requests[request_id] = candle_future
         try:
