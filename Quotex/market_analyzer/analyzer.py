@@ -485,6 +485,13 @@ VOLATILITY_HIGH_DAMPEN     = 0.90   # confidence x= this when volatility level =
 VOLATILITY_EXTREME_ATR_PCT = 1.5    # ATR% above this counts as "extreme" volatility
 VOLATILITY_EXTREME_DAMPEN  = 0.80   # confidence x= this when volatility is extreme
 
+# Minimum number of independently-agreeing (non-zero) confluence factors
+# required before a BUY/SELL is committed to; below this, generate_confluence_signal()
+# returns WAIT. Single source of truth — every caller (Manual Analyzer, Scanner,
+# Backtest) goes through generate_confluence_signal() below, so changing this
+# constant changes the requirement everywhere consistently.
+MIN_AGREEING_FACTORS = 2
+
 
 def _apply_market_condition_dampener(confidence: float, ind: Dict[str, Any]) -> Tuple[float, List[str]]:
     """
@@ -522,9 +529,9 @@ def generate_confluence_signal(df: pd.DataFrame, indicators_result: Dict[str, An
     proximity, OBV Divergence, Support/Resistance proximity, Wick Rejection,
     Liquidity Sweep, False Breakout), combined via weighted voting.
 
-    Requires >= 3 agreeing (non-zero) factors AND a non-tied weighted result
-    before committing to BUY/SELL; otherwise returns WAIT. Analysis only —
-    never places an order.
+    Requires >= MIN_AGREEING_FACTORS agreeing (non-zero) factors AND a
+    non-tied weighted result before committing to BUY/SELL; otherwise
+    returns WAIT. Analysis only — never places an order.
 
     Step 1: after the signal/confidence is determined from the vote, a
     market-condition dampener (weak ADX / elevated volatility) reduces the
@@ -538,7 +545,7 @@ def generate_confluence_signal(df: pd.DataFrame, indicators_result: Dict[str, An
     bearish_weight = sum(weights.get(name, 0) for name, v in votes.items() if v == -1)
     agreeing_factors = sum(1 for v in votes.values() if v != 0)
 
-    if agreeing_factors >= 3 and bullish_weight != bearish_weight:
+    if agreeing_factors >= MIN_AGREEING_FACTORS and bullish_weight != bearish_weight:
         signal = "BUY" if bullish_weight > bearish_weight else "SELL"
         confidence_raw = round(max(bullish_weight, bearish_weight), 1)
     else:
@@ -595,9 +602,14 @@ FILTER_SCORE_WEIGHTS: Dict[str, float] = {
 }
 assert abs(sum(FILTER_SCORE_WEIGHTS.values()) - 100.0) < 1e-9  # 20+15+15+20+15+10+5 = 100
 
-# The 6 mandatory gates — candlestick is graded/bonus, never mandatory.
+# The 5 mandatory gates — candlestick is graded/bonus, never mandatory.
+# multi_timeframe is intentionally EXCLUDED from this tuple: MTF is a
+# confidence modifier (see webapp/app.py::_run_pipeline()'s CONFIRMED/
+# PARTIAL/CONFLICTING handling), not a hard signal gate, so it must not be
+# able to block mandatory_pass either — it still contributes to the graded
+# filter_score below (0/8/15 points), just not to the pass/fail gate.
 _MANDATORY_FILTER_GATES = (
-    "ema_trend", "adx", "atr", "support_resistance", "multi_timeframe", "payout",
+    "ema_trend", "adx", "atr", "support_resistance", "payout",
 )
 
 # Phase 6 convention reused here: "near" a zone = within 1.0 ATR (same value
@@ -635,12 +647,15 @@ def calculate_filter_score(indicators: Dict[str, Any],
       Payout (10):       >=90->10, 85-90->8, 80-85->5, <80->0
       Candlestick (5):   reliability_score/100 * 5 (unchanged from Phase 7.0)
 
-    `mandatory_pass` (new, Phase 7.1): True only if all 6 mandatory gates meet
-    their ORIGINAL binary bar (same thresholds as Phase 7.0 — direction not
-    sideways / adx>=adx_trending / atr_pct<=atr_extreme_pct / safe_entry is
-    True / mtf CONFIRMED / payout>=min_payout). This is what the scanner uses
-    to decide whether to surface a signal — filter_score itself no longer
-    gates visibility, it only describes quality.
+    `mandatory_pass` (Phase 7.1, revised): True only if all 5 mandatory gates
+    meet their ORIGINAL binary bar (direction not sideways / adx>=adx_trending
+    / atr_pct<=atr_extreme_pct / safe_entry is True / payout>=min_payout).
+    Multi-Timeframe is NOT one of the mandatory gates — MTF is a confidence
+    modifier applied earlier in webapp/app.py::_run_pipeline(), not a hard
+    signal gate, so it cannot block mandatory_pass either; it still
+    contributes to the graded filter_score below. This is what the scanner
+    uses to decide whether to surface a signal — filter_score itself no
+    longer gates visibility, it only describes quality.
 
     Returns: {"filter_score": 0-100, "mandatory_pass": bool,
               "passed_filters": [...], "failed_filters": [...],
@@ -730,8 +745,10 @@ def calculate_filter_score(indicators: Dict[str, Any],
                                         "points": sr_points, "passed": sr_ok, "value": safe_entry}
     (passed if sr_ok else failed).append("support_resistance")
 
-    # 5. Multi-Timeframe — graded via the existing 3-state status. Mandatory
-    # bar unchanged: status == CONFIRMED.
+    # 5. Multi-Timeframe — graded via the existing 3-state status. NOT a
+    # mandatory gate (see _MANDATORY_FILTER_GATES) — MTF only contributes
+    # points to the graded filter_score; it can no longer block
+    # mandatory_pass. "passed"/"value" are still reported for transparency.
     mtf_status = (signal_data.get("multi_tf_status") or {}).get("status")
     mtf_ok = mtf_status == "CONFIRMED"
     if mtf_status == "CONFIRMED":

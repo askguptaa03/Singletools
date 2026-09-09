@@ -32,6 +32,7 @@ if str(_MARKET_DIR) not in sys.path:
 from api_quotex import AsyncQuotexClient
 from api_quotex.models import Candle
 from api_quotex.utils import sanitize_symbol  # diagnostic-only: mirrors client.py's own
+from api_quotex.constants import TIMEFRAMES as _TF_SECONDS_MAP
                                                # normalization so we can SHOW callers what
                                                # identifier will actually be used, without
                                                # changing that logic (which lives in the
@@ -240,6 +241,10 @@ class QuotexDataFetcher:
             # never guessed.
             "failure_category":       None,
             "failure_reason":         None,
+            # New diagnostics (4D): whether the broker's own asset row
+            # confirmed a timeframe list, and what it was, when known.
+            "available_timeframes_known":       False,
+            "advertised_available_timeframes":  None,
         }
         self.last_fetch_diagnostics = diag
 
@@ -259,6 +264,35 @@ class QuotexDataFetcher:
         # or unresolved value — that's what a caller diagnosing a failure
         # actually needs to see.
         diag["timeframe"] = timeframe
+
+        # Step 4A: pre-flight timeframe-support check, at the SAME shared
+        # layer both Manual Analyzer and Scanner go through (this function),
+        # so the protection applies to both, not just the /api/signal route.
+        # Only blocks when the broker's OWN asset row explicitly confirmed a
+        # timeframe list that does not include the requested one — missing
+        # or unconfirmed metadata is never treated as proof of anything,
+        # and the request proceeds to the existing retry logic unchanged.
+        try:
+            avail_pre = await self.get_available_assets()
+        except Exception:
+            avail_pre = {}
+        asset_info_pre = avail_pre.get(normalized_symbol) if avail_pre else None
+        if asset_info_pre:
+            tf_confirmed_pre = bool(asset_info_pre.get("available_timeframes_confirmed"))
+            tf_list_pre = asset_info_pre.get("available_timeframes") or []
+            diag["available_timeframes_known"] = tf_confirmed_pre
+            diag["advertised_available_timeframes"] = tf_list_pre if tf_confirmed_pre else None
+            tf_secs_pre = _TF_SECONDS_MAP.get(timeframe)
+            if tf_confirmed_pre and tf_secs_pre is not None and tf_secs_pre not in tf_list_pre:
+                diag["failure_category"] = "unsupported_timeframe"
+                diag["failure_reason"] = (
+                    f"unsupported_timeframe: asset '{normalized_symbol}' does not support the "
+                    f"'{timeframe}' timeframe on Quotex right now "
+                    f"(broker-confirmed available timeframes: {tf_list_pre})."
+                )
+                diag["availability_status"] = "available"  # asset itself is known/available
+                print(f"  ⚠  {diag['failure_reason']}")
+                return []
 
         attempt = 0
         while attempt <= max_retries:
@@ -349,9 +383,12 @@ class QuotexDataFetcher:
             except Exception:
                 avail = {}
             if avail:
-                is_live = normalized_symbol in avail
+                asset_info_retry = avail.get(normalized_symbol)
+                is_live = asset_info_retry is not None
                 diag["availability_status"] = "available" if is_live else "not_available"
                 diag["live_registry_symbol"] = normalized_symbol if is_live else None
+                if is_live:
+                    diag["is_open"] = bool(asset_info_retry.get("is_open"))
             else:
                 diag["availability_status"] = "unknown (live discovery unavailable)"
 
@@ -364,6 +401,17 @@ class QuotexDataFetcher:
                 # recorded above for this same attempt.
                 diag["failure_category"] = "unavailable"
                 diag["failure_reason"] = f"unavailable: asset '{normalized_symbol}' is not currently available from Quotex."
+                break
+
+            if diag["availability_status"] == "available" and diag.get("is_open") is False:
+                # Asset is known to Quotex but the broker itself currently
+                # reports it as closed (is_open=False) — distinct from the
+                # generic "unavailable" (unknown symbol) and from a plain
+                # "timeout" (symbol open, response just didn't arrive).
+                # Retrying a genuinely-closed asset is pointless, same
+                # reasoning as the not_available branch above.
+                diag["failure_category"] = "asset_closed"
+                diag["failure_reason"] = f"asset_closed: asset '{normalized_symbol}' is currently closed on Quotex (is_open=False)."
                 break
 
             if attempt >= max_retries:
