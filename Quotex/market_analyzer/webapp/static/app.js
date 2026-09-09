@@ -193,6 +193,48 @@ function fieldsOf(card) {
   return map;
 }
 
+/* ── Part 2-6: shared signal-actionable countdown ("Entry Window") ──────────
+ * One shared 1-second ticker drives every visible countdown element on the
+ * page (hero card, manual analyzer result card, scanner result rows) by
+ * re-querying [data-entry-window-end] each tick — no per-card timers to
+ * create/leak/clear. Purely a display concern: never affects signal
+ * generation, never places a trade. Distinct from "Expiry" (Quotex trade
+ * duration label) — this counts down to the NEXT CANDLE BOUNDARY the
+ * backend computed (entry_window_end), derived from the actual candle
+ * timestamp server-side, not from page-load time.
+ * ────────────────────────────────────────────────────────────────────────── */
+function _formatCountdownRemaining(msRemaining) {
+  if (msRemaining <= 0) return null; // caller shows the expired state
+  const totalSeconds = Math.ceil(msRemaining / 1000);
+  const mm = Math.floor(totalSeconds / 60);
+  const ss = totalSeconds % 60;
+  return `${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
+}
+
+function _renderCountdownInto(el, isoEnd, expiredText) {
+  const endMs = Date.parse(isoEnd);
+  if (Number.isNaN(endMs)) { el.textContent = '—'; return; }
+  const remaining = endMs - Date.now();
+  const formatted = _formatCountdownRemaining(remaining);
+  if (formatted) {
+    el.textContent = formatted;
+    el.classList.remove('countdown-expired');
+  } else {
+    el.textContent = expiredText || 'Signal expired';
+    el.classList.add('countdown-expired');
+  }
+}
+
+function _tickAllCountdowns() {
+  document.querySelectorAll('[data-entry-window-end]').forEach((el) => {
+    const isoEnd = el.dataset.entryWindowEnd;
+    if (!isoEnd) return;
+    const isRow = el.dataset.countdownKind === 'row';
+    _renderCountdownInto(el, isoEnd, isRow ? 'EXPIRED' : 'Signal expired');
+  });
+}
+setInterval(_tickAllCountdowns, 1000);
+
 function renderFilters(container, data) {
   const factors = {};
   (data.factors || []).forEach((f) => { factors[f.key] = f; });
@@ -328,6 +370,29 @@ function fillSignalCard(card, data, opts = {}) {
   const compareTf = data.multi_tf ? data.multi_tf.compare_tf : null;
   f.timeframes.textContent = compareTf ? `${tfLabel(data.timeframe)} + ${tfLabel(compareTf)}` : tfLabel(data.timeframe);
   f.expiry.textContent = opts.expiry || tfLabel(data.timeframe).replace('M', '') + ' Minute';
+
+  // Part 2-6: signal actionable countdown ("Entry Window") — distinct from
+  // the "Expiry" fact above (that's the Quotex trade-duration label, not
+  // touched). Tied to the candle boundary the backend computed
+  // (entry_window_end), NOT to page-load time or a fixed fake timer. Only
+  // shown for an actual BUY/SELL — a WAIT never gets a misleading
+  // countdown. The actual per-second update happens in the shared
+  // _tickAllCountdowns() ticker (see below) so one interval drives every
+  // visible countdown (hero card, manual result card, scanner rows) rather
+  // than one setInterval per card.
+  const ewEl = f['entry-window'];
+  if (ewEl) {
+    if (sig !== 'WAIT' && data.entry_window_end) {
+      ewEl.dataset.entryWindowEnd = data.entry_window_end;
+      ewEl.dataset.countdownKind = 'card';
+      _renderCountdownInto(ewEl, data.entry_window_end);
+    } else {
+      delete ewEl.dataset.entryWindowEnd;
+      ewEl.textContent = '—';
+      ewEl.classList.remove('countdown-expired');
+    }
+  }
+
   // Req 8: show analysis timestamp instead of static "Just Now"
   const _now = new Date();
   f.updated.textContent = _now.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true })
@@ -773,6 +838,10 @@ function signalRowHtml(r) {
   const sig = r.confluence.signal;
   const cls = sig.toLowerCase();
   const trendIco = sig === 'BUY' ? '▲' : sig === 'SELL' ? '▼' : '●';
+  const hasCountdown = sig !== 'WAIT' && r.entry_window_end;
+  const countdownHtml = hasCountdown
+    ? `<span class="signal-row-countdown" data-entry-window-end="${r.entry_window_end}" data-countdown-kind="row">--:--</span>`
+    : '';
   return `
     <div class="signal-row" data-asset="${r.asset}">
       <div class="signal-row-left">
@@ -783,6 +852,7 @@ function signalRowHtml(r) {
         </div>
       </div>
       <div class="signal-row-right">
+        ${countdownHtml}
         <span class="signal-row-score">${r.confluence.confidence}/100</span>
         <span class="dir-chip ${cls}">${sig}</span>
       </div>
