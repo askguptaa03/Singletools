@@ -12,7 +12,7 @@ zeroed. Zeroing would (a) be equivalent to permanently disabling an
 indicator, which is a Settings-level user decision
 (_apply_settings_weight_overrides in webapp/app.py), not something an
 automatic regime classifier should do, and (b) risks starving
-analyzer.generate_confluence_signal()'s "agreeing_factors >= 3" requirement
+analyzer.generate_confluence_signal()'s "agreeing_factors >= MIN_AGREEING_FACTORS" requirement
 of real information — vote counting is based on the factor's vote sign, not
 its weight, so a zeroed factor could still count toward "agreeing" while
 contributing nothing, which is a worse, more confusing outcome than a mild
