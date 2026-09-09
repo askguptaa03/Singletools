@@ -506,21 +506,32 @@ class ScannerEngine:
 
                 self.current_asset = None
                 self.current_timeframe = None  # Phase 8.3
-                self._cleanup_stale_cache()
+                # Cycle-finalization work (cache cleanup, history bookkeeping)
+                # is wrapped so an unexpected exception here can never kill
+                # the outer scan loop — it would otherwise propagate past
+                # this function's try/finally and silently end continuous
+                # scanning after just one cycle. Per-asset/per-timeframe
+                # fetch errors already have their own handling above; this
+                # is specifically for anything after that inner loop.
+                try:
+                    self._cleanup_stale_cache()
 
-                cycle_duration = _now() - self._cycle_started_at
-                self._last_full_cycle_duration = cycle_duration
-                self.history.append({
-                    "cycle": self.current_cycle,
-                    "started_at": _iso(self._cycle_started_at),
-                    "ended_at": _iso(_now()),
-                    "duration_seconds": round(cycle_duration, 2),
-                    "assets_scanned": cycle_success + cycle_failure,
-                    "assets_succeeded": cycle_success,
-                    "assets_failed": cycle_failure,
-                })
-                self._log_event("cycle_complete", f"cycle={self.current_cycle} duration={cycle_duration:.1f}s "
-                                                   f"success={cycle_success} failed={cycle_failure}")
+                    cycle_duration = _now() - self._cycle_started_at
+                    self._last_full_cycle_duration = cycle_duration
+                    self.history.append({
+                        "cycle": self.current_cycle,
+                        "started_at": _iso(self._cycle_started_at),
+                        "ended_at": _iso(_now()),
+                        "duration_seconds": round(cycle_duration, 2),
+                        "assets_scanned": cycle_success + cycle_failure,
+                        "assets_succeeded": cycle_success,
+                        "assets_failed": cycle_failure,
+                    })
+                    self._log_event("cycle_complete", f"cycle={self.current_cycle} duration={cycle_duration:.1f}s "
+                                                       f"success={cycle_success} failed={cycle_failure}")
+                except Exception as exc:  # noqa: BLE001 — logged, never kills continuous scanning
+                    cycle_duration = _now() - self._cycle_started_at
+                    self._log_event("cycle_finalize_error", f"cycle={self.current_cycle} error={exc}")
 
                 if self._stop_requested:
                     break

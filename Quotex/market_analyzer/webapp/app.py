@@ -20,6 +20,7 @@ import threading
 import time
 import calendar
 import traceback
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -53,7 +54,7 @@ import analytics_dashboard
 from adaptive_calibration import (
     build_calibration_report, generate_calibration_recommendations,
 )
-from api_quotex.constants import ASSETS
+from api_quotex.constants import ASSETS, TIMEFRAMES as _TF_SECONDS_MAP
 from scanner import ScannerEngine, ScannerConfig
 
 # Phase 7.4 — Settings Store / Backtest Engine / Indicator Registry.
@@ -145,19 +146,27 @@ def _asset_choices() -> Dict[str, list]:
 # implements that rule for those two routes; it does not change how
 # backtest/validation gate assets (they keep the static ASSETS dict as a
 # valid historical/reference universe — see their own inline comments below).
-def _check_live_asset(asset: str) -> Dict[str, Any]:
+def _check_live_asset(asset: str, timeframe: Optional[str] = None) -> Dict[str, Any]:
     """
     Live-operation asset gate. Source of truth is the CURRENT live Quotex
     snapshot (live_assets.get_live_assets(), full — OTC and regular pairs),
-    never the static ASSETS dict. Returns one of three real states:
+    never the static ASSETS dict. Returns one of these real states:
       - live discovery/session failure -> ok=False, status=503 (a session
         problem, not an "unknown asset" — never silently treated as known
         via the static list)
       - asset absent from the live snapshot -> ok=False, status=400
         (genuinely not available from Quotex right now)
-      - asset present in the live snapshot -> ok=True (open/closed is a
-        separate market-state fact the pipeline's own candle fetch already
-        surfaces; this gate only answers "does Quotex know this symbol")
+      - asset present, but the broker's OWN asset row explicitly confirmed a
+        timeframe list that does not include the requested `timeframe`
+        -> ok=False, status=400, kind="unsupported_timeframe" (fails fast,
+        no wasted candle-fetch retries on a combination the broker itself
+        already told us it doesn't support)
+      - asset present, and timeframe support is unknown/unconfirmed (missing
+        metadata, or `timeframe` not passed) -> ok=True — we do NOT block on
+        incomplete information; the existing candle-fetch retry path is the
+        source of truth in that case
+      - asset present and timeframe confirmed supported (or no timeframe
+        given) -> ok=True
     No fabrication in any branch.
     """
     try:
@@ -174,9 +183,28 @@ def _check_live_asset(asset: str) -> Dict[str, Any]:
         return {"ok": False, "status": 503,
                 "error": f"Cannot verify asset '{asset}' — live asset discovery returned no data "
                          f"(Quotex session issue)."}
-    if asset not in live_snapshot:
+    asset_info = live_snapshot.get(asset)
+    if asset_info is None:
         return {"ok": False, "status": 400,
                 "error": f"Asset '{asset}' is not currently available from Quotex."}
+
+    if timeframe:
+        tf_secs = _TF_SECONDS_MAP.get(timeframe)
+        tf_confirmed = bool(asset_info.get("available_timeframes_confirmed"))
+        tf_list = asset_info.get("available_timeframes") or []
+        # Only block when the broker's OWN data explicitly confirmed a
+        # timeframe list AND the requested timeframe is not in it. Missing/
+        # unconfirmed metadata (tf_confirmed False) is never treated as
+        # proof of anything — the request is allowed through to the
+        # existing retry-based candle fetch, unchanged.
+        if tf_confirmed and tf_secs is not None and tf_secs not in tf_list:
+            return {
+                "ok": False, "status": 400,
+                "kind": "unsupported_timeframe",
+                "error": f"Asset '{asset}' does not support the '{timeframe}' timeframe on Quotex "
+                         f"right now (broker-confirmed available timeframes: {tf_list}).",
+            }
+
     return {"ok": True, "status": 200, "error": None}
 
 
@@ -503,16 +531,24 @@ async def _run_pipeline(asset: str, timeframe: str) -> Dict[str, Any]:
                 s_primary = confluence["signal"]
                 s_compare = conf_cmp["signal"]
 
+                # MTF is a CONFIDENCE MODIFIER, not a signal gate: the primary
+                # timeframe's signal/direction is never changed here (no more
+                # forcing WAIT on disagreement). Only the confidence value is
+                # adjusted, and only when primary itself is not already WAIT.
                 if s_primary != "WAIT" and s_compare != "WAIT" and s_primary == s_compare:
                     mt_status = "CONFIRMED"
-                    # Boost primary confidence by 10%, capped at 95%
+                    # Same-direction confirmation: boost confidence by 10%, capped at 95%
                     confluence = dict(confluence, confidence=min(95, confluence["confidence"] + 10))
                 elif s_primary == "WAIT" or s_compare == "WAIT":
                     mt_status = "PARTIAL"
+                    # Comparison timeframe had no confirmation to offer —
+                    # neutral: no bonus, no penalty, primary stands as-is.
                 else:
                     mt_status = "CONFLICTING"
-                    # Both timeframes disagree — override to WAIT
-                    confluence = dict(confluence, signal="WAIT", confidence=0)
+                    # Comparison timeframe disagrees: apply a moderate
+                    # confidence penalty, but the primary signal/direction is
+                    # preserved — it is never overridden to WAIT.
+                    confluence = dict(confluence, confidence=max(0, confluence["confidence"] - 15))
 
                 multi_tf_result = {
                     "status": mt_status,
@@ -655,6 +691,51 @@ async def _run_pipeline(asset: str, timeframe: str) -> Dict[str, Any]:
         result["passed_filters"] = filter_result["passed_filters"]
         result["failed_filters"] = filter_result["failed_filters"]
         result["filter_breakdown"] = filter_result["filter_breakdown"]
+
+        # ── Part 2-4: signal actionable countdown metadata ──────────────────
+        # Additive only — never used for order placement (analysis/scanner
+        # only, no trade execution anywhere in this project). Gives the
+        # frontend everything it needs to compute a live countdown to the
+        # NEXT candle boundary for the selected timeframe, without the
+        # frontend inventing its own timing logic or using page-load time.
+        _tf_secs = _TF_SECONDS_MAP.get(timeframe)
+        _now_utc = datetime.now(timezone.utc)
+        result["generated_at"] = _now_utc.isoformat()
+        result["timeframe_seconds"] = _tf_secs
+
+        _candle_start = None
+        try:
+            if not df.empty:
+                _last_ts = df.index[-1]
+                _candle_start = _last_ts.to_pydatetime() if hasattr(_last_ts, "to_pydatetime") else _last_ts
+                if _candle_start is not None and _candle_start.tzinfo is None:
+                    # Quotex candle timestamps are epoch-seconds derived (UTC)
+                    _candle_start = _candle_start.replace(tzinfo=timezone.utc)
+        except Exception:
+            _candle_start = None
+
+        _next_boundary = None
+        if _tf_secs and _candle_start is not None:
+            # Preferred source: actual latest candle's start time + one
+            # timeframe interval = when that candle closes / the next
+            # candle begins. This is the "entry window" — not a Quotex
+            # trade-duration/option-expiry value (Part 3 distinction).
+            _next_boundary = _candle_start + timedelta(seconds=_tf_secs)
+        elif _tf_secs:
+            # Documented fallback (Part 4) — candle timestamp unavailable:
+            # align to the current-time grid instead. Clearly a fallback,
+            # not the preferred source; can be slightly off from the
+            # broker's actual candle boundary but avoids leaving the
+            # frontend with nothing to count down from.
+            _epoch_now = _now_utc.timestamp()
+            _next_epoch = (int(_epoch_now // _tf_secs) + 1) * _tf_secs
+            _next_boundary = datetime.fromtimestamp(_next_epoch, tz=timezone.utc)
+
+        result["candle_start"] = _candle_start.isoformat() if _candle_start else None
+        result["entry_window_end"] = _next_boundary.isoformat() if _next_boundary else None
+        result["entry_window_source"] = "candle_timestamp" if _candle_start is not None else (
+            "current_time_fallback" if _next_boundary is not None else None
+        )
 
         print(f"[PERF] ── pipeline done  total={_ts() - t0:.2f}s ──\n")
         return result
@@ -896,10 +977,12 @@ def api_signal():
     if timeframe not in TIMEFRAMES:
         return jsonify({"error": f"Invalid timeframe '{timeframe}'. Must be one of {TIMEFRAMES}."}), 400
     # P0 fix — Unknown Asset: gate against the live Quotex snapshot, not the
-    # stale static ASSETS dict (see _check_live_asset() docstring).
-    asset_check = _check_live_asset(asset)
+    # stale static ASSETS dict (see _check_live_asset() docstring). Also
+    # passes `timeframe` so a broker-confirmed unsupported combination fails
+    # fast instead of burning candle-fetch retries.
+    asset_check = _check_live_asset(asset, timeframe)
     if not asset_check["ok"]:
-        return jsonify({"error": asset_check["error"]}), asset_check["status"]
+        return jsonify({"error": asset_check["error"], "kind": asset_check.get("kind")}), asset_check["status"]
 
     try:
         # Fix 3: submit to the shared background loop so the persistent
@@ -2092,9 +2175,9 @@ def api_ai_explain():
             return jsonify({"error": f"Invalid timeframe '{timeframe}'. Must be one of {TIMEFRAMES}."}), 400
         # P0 fix — Unknown Asset: same live-snapshot gate as /api/signal
         # (see _check_live_asset() docstring); no longer the stale static dict.
-        asset_check = _check_live_asset(asset)
+        asset_check = _check_live_asset(asset, timeframe)
         if not asset_check["ok"]:
-            return jsonify({"error": asset_check["error"]}), asset_check["status"]
+            return jsonify({"error": asset_check["error"], "kind": asset_check.get("kind")}), asset_check["status"]
         try:
             _scanner.manual_request_started()
             try:
