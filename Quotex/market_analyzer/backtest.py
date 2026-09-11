@@ -1,8 +1,9 @@
 """
 Backtest-based dynamic factor weighting for the Quotex Market Analyzer.
 
-Replays each of the 10 confluence factors (bb, rsi_div, stoch, cci, candle,
-mean_reversion, exhaustion, round_number, obv, sr) bar-by-bar across
+Replays each of the 13 confluence factors (bb, rsi_div, stoch, cci, candle,
+mean_reversion, exhaustion, round_number, obv, sr, wick_rejection,
+liquidity_sweep, false_breakout) bar-by-bar across
 already-fetched historical candles, and measures how often each factor's
 vote correctly predicted price direction `lookahead` candles later. Purely
 historical/statistical analysis on data already in memory — NEVER places
@@ -19,11 +20,13 @@ try:
     from indicators import (
         bollinger_bands, rsi, stochastic_oscillator, cci, detect_candlestick_pattern_detailed, obv,
         _swing_high_low_prices, _cluster_zones, _SR_TOO_CLOSE_ATR, ema, adx as _adx_fn, atr as _atr_fn,
+        detect_wick_rejection, detect_liquidity_sweep, detect_false_breakout,
     )
 except ImportError:
     from market_analyzer.indicators import (
         bollinger_bands, rsi, stochastic_oscillator, cci, detect_candlestick_pattern_detailed, obv,
         _swing_high_low_prices, _cluster_zones, _SR_TOO_CLOSE_ATR, ema, adx as _adx_fn, atr as _atr_fn,
+        detect_wick_rejection, detect_liquidity_sweep, detect_false_breakout,
     )
 
 # Phase 5: mirrors analyzer.CANDLE_RELIABILITY_VOTE_THRESHOLD. Kept as an
@@ -36,6 +39,13 @@ CANDLE_RELIABILITY_VOTE_THRESHOLD = 40.0
 # Phase 6: mirrors analyzer.SR_RELIABILITY_VOTE_THRESHOLD, same
 # independent-constant convention as above.
 SR_RELIABILITY_VOTE_THRESHOLD = 40.0
+
+# Phase 5 (backtest 13-factor fix): mirrors analyzer.WICK_REJECTION_VOTE_
+# THRESHOLD / LIQUIDITY_SWEEP_VOTE_THRESHOLD / FALSE_BREAKOUT_VOTE_
+# THRESHOLD, same independent-constant convention as above.
+WICK_REJECTION_VOTE_THRESHOLD = 40.0
+LIQUIDITY_SWEEP_VOTE_THRESHOLD = 40.0
+FALSE_BREAKOUT_VOTE_THRESHOLD = 40.0
 
 # Phase 7: mirrors config.ADX_TRENDING / analyzer.VOLATILITY_EXTREME_ATR_PCT,
 # same independent-constant convention as above — used only by
@@ -109,7 +119,7 @@ assert len(_DEFAULT_8F_WEIGHTS) == 13
 def _factor_votes(df: pd.DataFrame,
                   indicators_history: Optional[Dict[str, Any]] = None) -> Dict[str, pd.Series]:
     """
-    Build a full-history +1 / 0 / -1 vote Series for each of the 10 confluence
+    Build a full-history +1 / 0 / -1 vote Series for each of the 13 confluence
     factors, replaying the same logic used in
     analyzer.generate_confluence_signal() across every bar (not just the
     latest one), so accuracy can be measured historically.
@@ -267,6 +277,66 @@ def _factor_votes(df: pd.DataFrame,
     sr_vote[near_resistance.fillna(False) & safe_entry & ~near_support.fillna(False)
             & known_resistance.notna()] = -1
 
+    # ── Wick Rejection / Liquidity Sweep / False Breakout (factors 11-13) ────
+    # Phase 5 fix (Phase 9's weights-dict expansion to 13 factors was never
+    # matched by a corresponding _factor_votes() update — these 3 factors
+    # had NO historical vote series at all, so backtest_factor_accuracy()
+    # could never compute accuracy for them and compute_dynamic_weights()
+    # always fell back to their static default weight, regardless of real
+    # historical performance).
+    #
+    # Same established pattern as the "Candlestick pattern" loop above:
+    # replay the exact live detector (indicators.detect_wick_rejection /
+    # detect_liquidity_sweep / detect_false_breakout) on a rolling,
+    # causal (no look-ahead) window ending at each bar, gated by the same
+    # reliability_score thresholds analyzer.py uses. Combined into one loop
+    # (instead of three separate loops) purely for efficiency — each
+    # function is still called independently, with its own window size
+    # matching what that live function actually requires. Reuses the
+    # atr_proxy Series already computed above for the S/R factor as the
+    # atr_value argument (same "shared, already-computed ATR" convention
+    # analyzer.py's calculate_all() -> generate_confluence_signal() uses
+    # live, instead of letting each detector silently recompute its own).
+    wick_rejection_vote = pd.Series(0, index=df.index)
+    liquidity_sweep_vote = pd.Series(0, index=df.index)
+    false_breakout_vote = pd.Series(0, index=df.index)
+
+    _ls_lookback = 20   # matches detect_liquidity_sweep()'s own default
+    _fb_lookback = 30   # matches detect_false_breakout()'s own default
+
+    for i in range(1, len(df)):
+        atr_v = float(atr_proxy.iloc[i]) if atr_proxy.iloc[i] > 0 else None
+
+        wr_window = df.iloc[i:i + 1]
+        wr_detail = detect_wick_rejection(wr_window, atr_value=atr_v)
+        if wr_detail is not None:
+            direction = wr_detail.get("direction")
+            reliability = wr_detail.get("reliability_score", 0) or 0
+            if direction == "BUY" and reliability >= WICK_REJECTION_VOTE_THRESHOLD:
+                wick_rejection_vote.iloc[i] = 1
+            elif direction == "SELL" and reliability >= WICK_REJECTION_VOTE_THRESHOLD:
+                wick_rejection_vote.iloc[i] = -1
+
+        ls_window = df.iloc[max(0, i - (_ls_lookback + 1)):i + 1]
+        ls_detail = detect_liquidity_sweep(ls_window, lookback=_ls_lookback, atr_value=atr_v)
+        if ls_detail is not None:
+            direction = ls_detail.get("direction")
+            reliability = ls_detail.get("reliability_score", 0) or 0
+            if direction == "BUY" and reliability >= LIQUIDITY_SWEEP_VOTE_THRESHOLD:
+                liquidity_sweep_vote.iloc[i] = 1
+            elif direction == "SELL" and reliability >= LIQUIDITY_SWEEP_VOTE_THRESHOLD:
+                liquidity_sweep_vote.iloc[i] = -1
+
+        fb_window = df.iloc[max(0, i - _fb_lookback - 1):i + 1]
+        fb_detail = detect_false_breakout(fb_window, sr_detail=None, atr_value=atr_v, lookback=_fb_lookback)
+        if fb_detail is not None:
+            direction = fb_detail.get("direction")
+            reliability = fb_detail.get("reliability_score", 0) or 0
+            if direction == "BUY" and reliability >= FALSE_BREAKOUT_VOTE_THRESHOLD:
+                false_breakout_vote.iloc[i] = 1
+            elif direction == "SELL" and reliability >= FALSE_BREAKOUT_VOTE_THRESHOLD:
+                false_breakout_vote.iloc[i] = -1
+
     return {
         "bb":             bb_vote,
         "rsi_div":        rsi_vote,
@@ -278,6 +348,9 @@ def _factor_votes(df: pd.DataFrame,
         "round_number":   rn_vote,
         "obv":            obv_vote,
         "sr":             sr_vote,
+        "wick_rejection":  wick_rejection_vote,
+        "liquidity_sweep": liquidity_sweep_vote,
+        "false_breakout":  false_breakout_vote,
     }
 
 
@@ -285,7 +358,7 @@ def backtest_factor_accuracy(df: pd.DataFrame,
                              indicators_history: Optional[Dict[str, Any]] = None,
                              lookahead: int = 4) -> Dict[str, Dict[str, Any]]:
     """
-    For each of the 10 confluence factors, replay historical +1/-1 votes and
+    For each of the 13 confluence factors, replay historical +1/-1 votes and
     check whether price moved in the voted direction `lookahead` candles later.
 
     Returns:
