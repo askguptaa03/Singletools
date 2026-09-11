@@ -18,6 +18,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
+from api_quotex.constants import TIMEFRAMES as _TF_SECONDS
+
 try:
     from analyzer import calculate_filter_score
 except ImportError:
@@ -768,6 +770,130 @@ class ScannerEngine:
 
         return {
             "top_signals": top,
+            "generated_at": _iso(_now()),
+            "cycle": self.current_cycle,
+            "schema_version": SCANNER_SCHEMA_VERSION,
+            "engine_version": SCANNER_ENGINE_VERSION,
+        }
+
+    def get_recommendations(self, min_confidence: Optional[float] = None,
+                             limit: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Phase 12 — dynamic multi-timeframe recommendation, built ONLY from
+        data _run_pipeline() already computes for every cached (asset, tf)
+        cell (self._cache, filled once per cycle by the SAME loop that
+        already scans every configured timeframe for every asset — no new
+        scan path, no second signal engine).
+
+        For each asset, considers every timeframe currently cached for it
+        and picks the single best candidate using the EXACT SAME ranking
+        key already used by get_results() (filter_score desc, confidence
+        desc, payout desc, freshness desc) — so "best" here means exactly
+        what the rest of the scanner already means by "best", not a new
+        invented score.
+
+        Status derivation (uses only fields that already exist — no
+        fabricated AI/indicator votes):
+          TRADE       — best candidate passes mandatory_pass (all existing
+                        hard gates: ema_trend/adx/atr/support_resistance/
+                        payout) AND confidence >= min_conf (the scanner's
+                        own existing confidence bar) — i.e. it would
+                        already qualify for get_results() today.
+          WATCH       — best candidate is a real BUY/SELL and passes
+                        mandatory_pass, but confidence is below min_conf —
+                        directionally real per existing gates, just not
+                        strong enough to clear the existing bar.
+          NOT_TRADE   — best candidate is a real BUY/SELL but fails
+                        mandatory_pass (an existing hard gate rejected it).
+          (asset omitted) — every cached timeframe for that asset is WAIT
+                        or missing — "NO RECOMMENDATION" per spec; this
+                        method never fabricates a recommendation for an
+                        asset with no real candidate.
+        """
+        min_conf = min_confidence if min_confidence is not None else self.cfg.min_confidence
+        limit = limit or self.cfg.top_n
+
+        by_asset: Dict[str, List[Dict[str, Any]]] = {}
+        for (asset, tf), entry in self._cache.items():
+            by_asset.setdefault(asset, []).append(dict(entry, timeframe=tf))
+
+        def _rank_key(e: Dict[str, Any]):
+            filter_score = e.get("filter_score", 0) or 0
+            confidence = e.get("confluence", {}).get("confidence", 0) or 0
+            payout = e.get("payout_pct") or 0
+            freshness_epoch = self._parse_iso_epoch(e.get("last_update", ""))
+            return (-filter_score, -confidence, -payout, -freshness_epoch)
+
+        recommendations = []
+        for asset, entries in by_asset.items():
+            # Full per-timeframe comparison table (Section G) — includes
+            # WAIT rows too, so the UI can show e.g. "15M WAIT" alongside
+            # the actionable timeframes, exactly as the spec's example
+            # shows. Never used to produce a recommendation by itself.
+            timeframe_table = sorted(
+                [
+                    {
+                        "timeframe": e["timeframe"],
+                        "signal": e.get("confluence", {}).get("signal"),
+                        "confidence": e.get("confluence", {}).get("confidence", 0) or 0,
+                        "filter_score": e.get("filter_score", 0) or 0,
+                        "mandatory_pass": bool(e.get("mandatory_pass")),
+                        "entry_window_end": e.get("entry_window_end"),
+                    }
+                    for e in entries
+                ],
+                key=lambda row: _TF_SECONDS.get(row["timeframe"], 0),
+            )
+
+            candidates = [e for e in entries if (e.get("confluence", {}).get("signal") in ("BUY", "SELL"))]
+            if not candidates:
+                continue  # every cached timeframe is WAIT/missing -> NO RECOMMENDATION for this asset
+
+            # Ranking happens ONLY among valid (mandatory_pass) candidates
+            # first — a timeframe that fails an existing hard gate must
+            # never shadow/outrank a different timeframe on the SAME asset
+            # that actually clears every gate. Only when literally none of
+            # the asset's candidates pass do we fall back to the best of
+            # the failing ones, purely so it can still be surfaced as
+            # NOT_TRADE (never as TRADE/WATCH).
+            passing = [e for e in candidates if e.get("mandatory_pass")]
+            if passing:
+                best = min(passing, key=_rank_key)
+            else:
+                best = min(candidates, key=_rank_key)
+            best_conf = best.get("confluence", {})
+            best_confidence = best_conf.get("confidence", 0) or 0
+
+            if best.get("mandatory_pass") and best_confidence >= min_conf:
+                status = "TRADE"
+            elif best.get("mandatory_pass"):
+                status = "WATCH"
+            else:
+                status = "NOT_TRADE"
+
+            recommendations.append({
+                "asset": asset,
+                "status": status,
+                "recommended_timeframe": best["timeframe"],
+                "signal": best_conf.get("signal"),
+                "confidence": best_confidence,
+                "filter_score": best.get("filter_score", 0) or 0,
+                "payout_pct": best.get("payout_pct"),
+                "regime": best.get("regime"),
+                "multi_tf_status": best.get("multi_tf_status"),
+                "indicators": best.get("indicators"),
+                "entry_window_end": best.get("entry_window_end"),
+                "candle_start": best.get("candle_start"),
+                "generated_at": best.get("generated_at"),
+                "timeframes": timeframe_table,
+            })
+
+        recommendations.sort(key=lambda r: (
+            {"TRADE": 0, "WATCH": 1, "NOT_TRADE": 2}.get(r["status"], 3),
+            -(r["filter_score"] or 0), -(r["confidence"] or 0),
+        ))
+        return {
+            "recommendations": recommendations[:limit],
             "generated_at": _iso(_now()),
             "cycle": self.current_cycle,
             "schema_version": SCANNER_SCHEMA_VERSION,
