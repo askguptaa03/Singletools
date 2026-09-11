@@ -7,7 +7,7 @@ import requests
 import uuid
 import base64
 from typing import Dict, List, Any, Callable, Optional, Union, Tuple
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
 import pandas as pd
 from loguru import logger
@@ -1042,10 +1042,34 @@ class AsyncQuotexClient:
         if not hasattr(self, "_fast_store"):
             self._fast_store = FastCandleStore()
 
-        # Instant answer if we already have enough candles cached
+        # Instant answer if we already have enough candles cached — but only
+        # if the latest cached candle's own boundary hasn't already passed
+        # (Patch 2, Phase 2.8). Reuses the existing FastCandleStore API
+        # unchanged (add_many/get_tail/size not modified) — this only
+        # changes the decision of whether the cache-hit branch is taken.
         cached_n = self._fast_store.size(sym, tf_secs)
         if cached_n >= max(1, count):
-            return self._fast_store.get_tail(sym, tf_secs, count)
+            is_fresh = False
+            try:
+                _tail = self._fast_store.get_tail(sym, tf_secs, 1)
+                if _tail:
+                    _boundary = _tail[-1].timestamp + timedelta(seconds=tf_secs)
+                    is_fresh = _boundary > datetime.now(timezone.utc)
+                # else: unexpected empty tail despite cached_n > 0 — do not
+                # crash, do not fabricate anything; is_fresh stays False so
+                # this falls through to the existing fetch path below,
+                # exactly like a stale-cache result.
+            except Exception:
+                # Any unexpected error while checking freshness must never
+                # block or crash the request — fall through to the existing
+                # fetch path, same as a stale-cache result.
+                is_fresh = False
+            if is_fresh:
+                return self._fast_store.get_tail(sym, tf_secs, count)
+            # else: stale — deliberately fall through to the existing
+            # cache-miss / broker-fetch path below. No new retry system,
+            # no new locks, no background refresh — same _request_candles()
+            # call, same exception handling, same failure_category logic.
 
         # Not enough in cache → fetch and then merge
         try:
@@ -1410,7 +1434,15 @@ class AsyncQuotexClient:
 
                         vol = float(vol) if vol is not None else 0.0
                         candle = Candle(
-                            timestamp=datetime.fromtimestamp(ts),
+                            # Patch 1 (Phase 2.8) — explicit UTC. Was previously
+                            # datetime.fromtimestamp(ts) with no tz=, which
+                            # interprets epoch seconds in the SERVER's local
+                            # system timezone rather than UTC — ambiguous and
+                            # environment-dependent. This is the only candle-
+                            # timestamp conversion site; order/deal timestamps
+                            # (_parse_timestamp()) and _qx_expiration_epoch()
+                            # are unrelated and intentionally left untouched.
+                            timestamp=datetime.fromtimestamp(ts, tz=timezone.utc),
                             open=o, high=hi, low=lo, close=c, volume=vol,
                             asset=asset, timeframe=int(timeframe)
                         )
