@@ -145,9 +145,13 @@
                 <span class="hero-asset" data-f="asset">—</span>
                 <span class="hero-tf" data-f="tf-badge">—</span>
               </div>
-              <span class="hero-direction" data-f="direction">WAIT</span>
+              <div class="hero-direction-wrap">
+                <span class="hero-arrow" data-f="arrow" hidden></span>
+                <span class="hero-direction" data-f="direction">WAIT</span>
+              </div>
             </div>
             <p class="hero-subtitle" data-f="subtitle">—</p>
+            <span class="action-status-badge" data-f="action-status" hidden>—</span>
 
             <div class="hero-score-row">
               <div class="gauge-wrap">
@@ -652,6 +656,21 @@
             <div class="metric-card"><span class="k">Last Scan</span><span class="v" id="ss-last-scan">—</span></div>
           </div>
         </div>
+
+        <div class="section-head" style="margin-top:20px;">
+          <h3 class="section-title">⭐ Recommended Timeframe</h3>
+        </div>
+        <div id="ss-recommendations-slot" class="glass-card ss-results-card">
+          <div class="tab-empty">Press Start Scanner to see per-asset timeframe recommendations.</div>
+        </div>
+        <p class="page-intro small">
+          For each asset, the scanner compares every timeframe it has
+          already scanned this cycle and picks the single best one —
+          dynamically, never a fixed timeframe. 🟢 TRADE / 🟡 WATCH /
+          🔴 NOT TRADE reflect the SAME mandatory gates and confidence bar
+          used everywhere else in the scanner. WAIT is never recommended.
+          Analysis only; nothing here places a trade.
+        </p>
 
         <div class="section-head" style="margin-top:20px;">
           <h3 class="section-title">Ranked Signals</h3>
