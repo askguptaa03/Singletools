@@ -243,7 +243,7 @@ function renderFilters(container, data) {
 
   const items = [
     { label: 'EMA 50', state: data.trend && trendWord(data.trend) !== 'Neutral' ? 'pass' : 'fail' },
-    { label: 'EMA 200', state: mt ? (mt.status === 'CONFIRMED' ? 'pass' : 'fail') : 'na' },
+    { label: 'EMA 200', state: data.trend && trendWord(data.trend) !== 'Neutral' ? 'pass' : 'fail' },
     { label: 'ADX > 25', state: ind.adx != null ? (ind.adx > 25 ? 'pass' : 'fail') : 'na' },
     { label: 'ATR', state: ind.atr_pct != null ? 'pass' : 'na' },
     { label: 'RSI', state: factors.rsi_div ? (factors.rsi_div.vote !== 'NEUTRAL' ? 'pass' : 'fail') : 'na' },
@@ -351,6 +351,29 @@ function renderCardChart(canvas, data) {
  * Fill a cloned signal-card template with a /api/signal response.
  * opts: { expiry, tfOverride, showChart }
  */
+// ── Phase 13: shared TRADE/WATCH/NOT_TRADE derivation ───────────────────────
+// Single source of truth reused by Manual Analyzer, Scanner-row-click,
+// History-row-click, and Notification-click (all funnel through
+// fillSignalCard() below) — so the same evidence always produces the same
+// status everywhere, never a second independent scoring system.
+//
+// MANUAL_TRADE_MIN_CONFIDENCE mirrors the project's own existing
+// ScannerConfig.min_confidence default (70.0, see scanner.py) — the same
+// "actionable" bar already used for Scanner's TRADE status in Phase 12.
+// Not a new invented threshold.
+const MANUAL_TRADE_MIN_CONFIDENCE = 70;
+
+function deriveActionStatus(data) {
+  const sig = (data.confluence || {}).signal;
+  if (sig !== 'BUY' && sig !== 'SELL') return null; // WAIT (or unknown) never gets a status badge
+  const confidence = (data.confluence || {}).confidence || 0;
+  const mandatoryPass = data.mandatory_pass;
+  if (mandatoryPass === true && confidence >= MANUAL_TRADE_MIN_CONFIDENCE) return 'TRADE';
+  if (mandatoryPass === true) return 'WATCH';
+  if (mandatoryPass === false) return 'NOT_TRADE';
+  return null; // mandatory_pass unknown (e.g. an older stored entry) -> no fabricated status
+}
+
 function fillSignalCard(card, data, opts = {}) {
   const f = fieldsOf(card);
   const sig = (data.confluence || {}).signal || 'WAIT';
@@ -362,6 +385,26 @@ function fillSignalCard(card, data, opts = {}) {
   f.direction.textContent = sig;
   f.direction.className = `hero-direction ${sigClass}`;
   f.subtitle.textContent = directionWord(sig);
+
+  // Phase 14: directional arrow, derived ONLY from the actual signal field
+  // (never hardcoded separately) — BUY -> up, SELL -> down, WAIT -> none.
+  if (f.arrow) {
+    if (sig === 'BUY') { f.arrow.textContent = '↑'; f.arrow.className = 'hero-arrow buy'; f.arrow.hidden = false; }
+    else if (sig === 'SELL') { f.arrow.textContent = '↓'; f.arrow.className = 'hero-arrow sell'; f.arrow.hidden = false; }
+    else { f.arrow.hidden = true; f.arrow.textContent = ''; }
+  }
+
+  const actionStatus = deriveActionStatus(data);
+  if (f['action-status']) {
+    if (actionStatus) {
+      const statusLabel = { TRADE: '🟢 TRADE', WATCH: '🟡 WATCH', NOT_TRADE: '🔴 NOT TRADE' }[actionStatus];
+      f['action-status'].textContent = statusLabel;
+      f['action-status'].className = `action-status-badge ${actionStatus.toLowerCase()}`;
+      f['action-status'].hidden = false;
+    } else {
+      f['action-status'].hidden = true;
+    }
+  }
 
   setGauge(f['gauge-circle'], f['gauge-value'], conf, sigClass);
   animateCount(f.score, conf);
@@ -505,8 +548,41 @@ let _unseenNotifs = 0;
 function pushNotification(data) {
   const sig = (data.confluence || {}).signal;
   if (sig !== 'BUY' && sig !== 'SELL') return;
+
+  const asset = data.asset;
+  const timeframe = data.timeframe;
+  const candleStart = data.candle_start || null;
+
+  // Candle-aware dedup (mirrors saveToHistory()'s Phase 8 identity): the
+  // same asset+timeframe+signal on a LATER candle is a genuinely new
+  // occurrence and must still notify — only an exact repeat for the SAME
+  // candle is suppressed. Entries with no candle_start (older in-memory
+  // entries, or a response where it was unavailable) are never treated as
+  // a match, since there's no safe way to confirm they're the same candle.
+  if (candleStart) {
+    const dupIdx = _notifFeed.findIndex((n) => n && n.candle_start && n.asset === asset
+      && n.timeframe === timeframe && n.signal === sig && n.candle_start === candleStart);
+    if (dupIdx !== -1) return; // already notified for this exact signal+candle
+  }
+
   _notifFeed.unshift({
-    asset: data.asset, signal: sig, confidence: (data.confluence || {}).confidence || 0, ts: Date.now(),
+    asset: asset, timeframe: timeframe, signal: sig,
+    confidence: (data.confluence || {}).confidence || 0,
+    candle_start: candleStart, ts: Date.now(),
+    // Phase 13F: preserve full original evidence — same exact fields
+    // saveToHistory() already stores (Phase 8) — so a notification click
+    // can open the FULL original detail view with zero new API request.
+    // Dedup identity/behavior above is completely untouched by this.
+    payout: data.payout_pct || null,
+    generated_at: data.generated_at || null,
+    entry_window_end: data.entry_window_end || null,
+    confluence: data.confluence || null,
+    factors: data.factors || null,
+    multi_tf_status: data.multi_tf_status || null,
+    indicators: data.indicators || null,
+    regime: data.regime || null,
+    mandatory_pass: data.mandatory_pass,
+    filter_score: data.filter_score,
   });
   _notifFeed = _notifFeed.slice(0, 20);
   _unseenNotifs += 1;
@@ -520,8 +596,8 @@ function renderNotifPanel() {
     list.innerHTML = '<div class="tab-empty small">No signals yet — run a scan to populate this feed.</div>';
     return;
   }
-  list.innerHTML = _notifFeed.map((n) => `
-    <div class="notif-row">
+  list.innerHTML = _notifFeed.map((n, idx) => `
+    <div class="notif-row" data-idx="${idx}">
       <div class="notif-row-left">
         <span class="notif-asset">${fmtLabel(n.asset)}</span>
         <span class="notif-time">${timeAgo(n.ts)}</span>
@@ -529,6 +605,34 @@ function renderNotifPanel() {
       <span class="dir-chip ${n.signal.toLowerCase()}">${n.signal} ${n.confidence}%</span>
     </div>
   `).join('');
+  bindNotifRowClicks(list, _notifFeed);
+}
+
+function bindNotifRowClicks(container, feed) {
+  // Phase 13F: mirrors bindHistoryRowClicks() (Phase 8) exactly — index-
+  // based lookup (an asset can legitimately notify more than once across
+  // different candles), reuse renderManualResult() to open the FULL
+  // ORIGINAL stored notification, zero new /api/signal request, zero
+  // re-analysis, zero countdown restart (entry_window_end is the same
+  // stored value it always was).
+  container.querySelectorAll('.notif-row').forEach((row) => {
+    row.addEventListener('click', () => {
+      const entry = feed[Number(row.dataset.idx)];
+      if (!entry) return;
+      // Backward compatibility: older in-memory notifications (before this
+      // fix) only have the flat signal/confidence fields, no nested
+      // `confluence` object — synthesize one so the detail view renders
+      // correctly instead of showing WAIT. No-op for newer entries.
+      const detailData = Object.assign({}, entry, {
+        confluence: entry.confluence || { signal: entry.signal, confidence: entry.confidence },
+      });
+      notifPanel.hidden = true;
+      selectManualAsset(detailData.asset);
+      if (detailData.timeframe) $('man-timeframe').value = detailData.timeframe;
+      navigateTo('analyzer');
+      renderManualResult(detailData);
+    });
+  });
 }
 
 $('notif-btn').addEventListener('click', () => {
@@ -782,8 +886,12 @@ async function runScan() {
     const res = await enqueueSignalRequest(asset, SCAN_TIMEFRAME, REQUEST_TIMEOUT_MS);
     if (res.ok) {
       results.push(res.data);
-      saveToHistory(res.data);
-      if ((res.data.confluence || {}).signal !== 'WAIT') pushNotification(res.data);
+      // Fix 1 (Phase 8): don't pollute History with WAIT — same signal
+      // check pushNotification() already uses.
+      if ((res.data.confluence || {}).signal !== 'WAIT') {
+        saveToHistory(res.data);
+        pushNotification(res.data);
+      }
     }
     if (i < SCAN_LIST.length - 1) await sleep(SCAN_REQUEST_GAP_MS);
     if (!_scanning) return; // cancelled mid-scan (tab switched away)
@@ -1092,8 +1200,12 @@ async function runManualAnalysis() {
     return;
   }
 
-  saveToHistory(res.data);
-  if ((res.data.confluence || {}).signal !== 'WAIT') pushNotification(res.data);
+  // Fix 1 (Phase 8): don't pollute History with WAIT — same signal check
+  // pushNotification() already uses.
+  if ((res.data.confluence || {}).signal !== 'WAIT') {
+    saveToHistory(res.data);
+    pushNotification(res.data);
+  }
   try {
     renderManualResult(res.data, expiry);
   } catch (err) {
@@ -1176,9 +1288,37 @@ function saveToHistory(data) {
     signal: (data.confluence || {}).signal || '—',
     confidence: (data.confluence || {}).confidence || 0,
     payout: data.payout_pct || null,
+    // Fix 3 (Phase 8): preserve the richer fields already present in the
+    // /api/signal response — exact existing field names, nothing invented —
+    // so a history entry can later be opened as a full, countdown-capable
+    // detail view instead of just a summary line.
+    generated_at: data.generated_at || null,
+    candle_start: data.candle_start || null,
+    entry_window_end: data.entry_window_end || null,
+    confluence: data.confluence || null,
+    factors: data.factors || null,
+    multi_tf_status: data.multi_tf_status || null,
+    indicators: data.indicators || null,
+    regime: data.regime || null,
   };
   let hist = [];
   try { hist = JSON.parse(localStorage.getItem(HIST_KEY) || '[]'); } catch (_) {}
+
+  // Fix 2 (Phase 8): candle-aware dedup. The same asset+timeframe+signal on
+  // a LATER candle is a genuinely new occurrence and must get its own
+  // entry — so identity includes candle_start, not just asset+timeframe+
+  // signal. Only replaces an existing entry when candle_start on BOTH
+  // sides is known and matches; older entries saved before this fix (no
+  // candle_start) are never treated as a match, since there's no safe way
+  // to confirm they're the same candle — they're simply left alone and a
+  // new entry is added, same as today's un-deduplicated behavior for them.
+  if (entry.candle_start) {
+    const dupIdx = hist.findIndex((e) => e && e.candle_start && e.asset === entry.asset
+      && e.timeframe === entry.timeframe && e.signal === entry.signal
+      && e.candle_start === entry.candle_start);
+    if (dupIdx !== -1) hist.splice(dupIdx, 1); // replace with the newer/richer entry below
+  }
+
   hist.unshift(entry);
   if (hist.length > 150) hist = hist.slice(0, 150);
   try { localStorage.setItem(HIST_KEY, JSON.stringify(hist)); } catch (_) {}
@@ -1190,14 +1330,14 @@ function renderHistory() {
   let hist = [];
   try { hist = JSON.parse(localStorage.getItem(HIST_KEY) || '[]'); } catch (_) {}
   if (hist.length === 0) { list.innerHTML = '<div class="tab-empty">No signals generated yet this session.</div>'; return; }
-  list.innerHTML = hist.map((e) => {
+  list.innerHTML = hist.map((e, idx) => {
     const dt = new Date(e.ts);
     const ts = dt.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
     const ds = dt.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' });
     const sc = (e.signal || '').toLowerCase();
     const payout = e.payout ? ` · ${e.payout}% payout` : '';
     return `
-      <div class="history-row">
+      <div class="history-row" data-idx="${idx}">
         <div class="history-left">
           <span class="history-asset">${fmtLabel(e.asset)}</span>
           <span class="history-meta">${tfLabel(e.timeframe)}${payout}</span>
@@ -1209,6 +1349,37 @@ function renderHistory() {
         </div>
       </div>`;
   }).join('');
+  bindHistoryRowClicks(list, hist);
+}
+
+function bindHistoryRowClicks(container, hist) {
+  // Fix 4 (Phase 8): open a history entry as a full signal detail, reusing
+  // the existing renderManualResult() render path — no new /api/signal
+  // request, no re-analysis, no new timestamps. A separate function from
+  // bindSignalRowClicks() on purpose: that one looks rows up by asset
+  // (fine for a scanner list where each asset appears once), but History
+  // can legitimately contain the same asset multiple times across
+  // different candles, so rows here are looked up by their exact index
+  // in the array that was just rendered instead.
+  container.querySelectorAll('.history-row').forEach((row) => {
+    row.addEventListener('click', () => {
+      const entry = hist[Number(row.dataset.idx)];
+      if (!entry) return;
+      // Backward compatibility: entries saved before Fix 3 only have the
+      // old flat signal/confidence fields, no nested `confluence` object.
+      // Synthesize one so the existing detail view (which reads
+      // data.confluence.signal/confidence) renders correctly instead of
+      // silently showing everything as WAIT. No-op for newer entries that
+      // already have a real `confluence` object.
+      const detailData = Object.assign({}, entry, {
+        confluence: entry.confluence || { signal: entry.signal, confidence: entry.confidence },
+      });
+      selectManualAsset(detailData.asset);
+      if (detailData.timeframe) $('man-timeframe').value = detailData.timeframe;
+      navigateTo('analyzer');
+      renderManualResult(detailData);
+    });
+  });
 }
 
 $('clear-history-btn').addEventListener('click', () => {
@@ -1887,6 +2058,65 @@ async function loadScannerResults() {
   } catch (e) { /* keep whatever results are already shown on a transient failure */ }
 }
 
+// ── Phase 12: dynamic multi-timeframe recommendation ────────────────────────
+async function loadScannerRecommendations() {
+  try {
+    const res = await fetch('/api/scanner/recommendations');
+    const data = await res.json();
+    ssRenderRecommendations(data);
+  } catch (e) { /* keep whatever is already shown on a transient failure */ }
+}
+
+function ssRenderRecommendations(payload) {
+  const slot = $('ss-recommendations-slot');
+  if (!slot) return;
+  const recs = payload.recommendations || [];
+  if (recs.length === 0) {
+    slot.innerHTML = '<div class="tab-empty">No recommendation yet — every scanned asset is currently WAIT or has no valid candidate.</div>';
+    return;
+  }
+  const statusMeta = {
+    TRADE:     { emoji: '🟢', label: 'TRADE' },
+    WATCH:     { emoji: '🟡', label: 'WATCH' },
+    NOT_TRADE: { emoji: '🔴', label: 'NOT TRADE' },
+  };
+  slot.innerHTML = recs.map((r) => {
+    const meta = statusMeta[r.status] || statusMeta.NOT_TRADE;
+    const arrowIco = r.signal === 'BUY' ? '↑' : r.signal === 'SELL' ? '↓' : '';
+    const sigIco = r.signal === 'BUY' ? '🟢 BUY' : r.signal === 'SELL' ? '🔴 SELL' : r.signal || '—';
+    // Same ADX-band strength label renderMetrics() already uses for the
+    // Manual Analyzer's "Trend Strength" — reused, not a new metric.
+    const adx = (r.indicators || {}).adx;
+    const strength = adx == null ? '' : (adx >= 40 ? ' · VERY STRONG' : adx >= 25 ? ' · STRONG' : adx >= 15 ? ' · MODERATE' : ' · WEAK');
+    const countdownHtml = (r.signal !== 'WAIT' && r.entry_window_end)
+      ? `<span data-entry-window-end="${r.entry_window_end}" data-countdown-kind="row">--:--</span>`
+      : '—';
+    const tfRows = (r.timeframes || []).map((row) => {
+      const isWinner = row.timeframe === r.recommended_timeframe;
+      const dirCls = (row.signal || 'wait').toLowerCase();
+      const star = isWinner ? ' ⭐' : '';
+      return `<div class="rec-tf-row${isWinner ? ' winner' : ''}">
+        <span>${tfLabel(row.timeframe)}</span>
+        <span class="rec-tf-dir ${dirCls}">${row.signal || 'WAIT'}</span>
+        <span>${row.signal && row.signal !== 'WAIT' ? row.confidence + '%' : ''}${star}</span>
+      </div>`;
+    }).join('');
+    const regimeName = (r.regime || {}).name;
+    return `
+      <div class="rec-card">
+        <div class="rec-card-top">
+          <span class="rec-card-asset">${fmtLabel(r.asset)}</span>
+          <span class="rec-status-badge ${r.status.toLowerCase()}">${meta.emoji} ${meta.label}</span>
+        </div>
+        <div class="rec-card-sub"><span class="rec-arrow ${(r.signal||'').toLowerCase()}">${arrowIco}</span> ${sigIco}${r.confidence ? ' · ' + r.confidence + '%' + strength : ''}</div>
+        <div class="rec-card-tf-star">⭐ TRADE ON: ${tfLabel(r.recommended_timeframe).toUpperCase()}</div>
+        <div class="rec-card-sub">⏱ Entry Window: ${countdownHtml}</div>
+        <div class="rec-card-sub">${r.payout_pct ? 'Payout ' + r.payout_pct + '%' : ''}${regimeName ? ' · Regime ' + regimeName : ''}</div>
+        <div class="rec-tf-table">${tfRows}</div>
+      </div>`;
+  }).join('');
+}
+
 /* ── M1: Full Scanner Diagnostics ─────────────────────────────────────────
  * Read-only view of /api/scanner/diagnostics — EVERY configured asset/
  * timeframe, not just the ones Ranked Signals surfaces, each labeled
@@ -1979,6 +2209,7 @@ async function pollScannerStatus() {
     ssRenderStatus(data);
     if (data.running) {
       loadScannerResults();
+      loadScannerRecommendations();
       if (_ssDiagVisible) loadScannerDiagnostics();
       if (!_ssPollTimer) _ssPollTimer = setInterval(pollScannerStatus, 2000);
     } else if (_ssPollTimer) {
