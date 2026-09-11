@@ -1022,6 +1022,25 @@ def api_signal():
 
     if "error" in result:
         return jsonify(result), 502
+
+    # Phase 15 (Part 1) — Manual Analyzer safety foundation: re-verify
+    # current live open/closed state right before returning an actionable
+    # result. This is purely additive metadata (result["asset_status"]) —
+    # _run_pipeline()/generate_confluence_signal()/MTF are completely
+    # untouched, and the signal/confidence/direction already computed are
+    # never altered here. The frontend is responsible for using this field
+    # to withhold an actionable TRADE presentation for a closed asset
+    # (Part 2) — this endpoint only supplies the honest, freshly-checked
+    # fact, never fabricates or guesses it.
+    sig = (result.get("confluence") or {}).get("signal")
+    if sig in ("BUY", "SELL"):
+        try:
+            fetcher = _run_bg(_get_shared_fetcher(), timeout=10.0)
+            live_now = _run_bg(live_assets.get_live_assets(fetcher), timeout=10.0)
+            info = (live_now or {}).get(asset)
+            result["asset_status"] = "open" if (info and info.get("is_open")) else "closed" if info else "unknown"
+        except Exception:
+            result["asset_status"] = "unknown"  # never guess/fabricate on failure
     return jsonify(result)
 
 
@@ -1314,6 +1333,53 @@ def api_assets_live():
     })
 
 
+@app.route("/api/assets/live/catalog", methods=["GET"])
+def api_assets_live_catalog():
+    """
+    Phase 15 (Part 1) — unified live asset catalog, ACROSS ALL categories
+    Quotex's live session returns (not just OTC). New, additive endpoint —
+    does not touch /api/assets/live's existing contract or behavior, so
+    nothing that currently depends on that route can regress. Same shared
+    fetcher/session as every other route (no second Quotex login).
+
+    Query params:
+      ?refresh=1   bypass live_assets.py's short in-process cache.
+
+    On any session/connection failure, returns success=false with zero
+    counts — never a fabricated/static catalog.
+    """
+    force_refresh = request.args.get("refresh", "").strip().lower() in ("1", "true", "yes")
+
+    try:
+        fetcher = _run_bg(_get_shared_fetcher(), timeout=30.0)
+    except Exception as exc:
+        return jsonify({
+            "success": False, "error": f"No active Quotex session — {exc}",
+            "total_available": 0, "category_counts": {}, "assets": [],
+        }), 503
+
+    try:
+        live = _run_bg(live_assets.get_live_assets(fetcher, force_refresh=force_refresh), timeout=30.0)
+    except Exception as exc:
+        return jsonify({
+            "success": False, "error": f"Failed to fetch live asset list from Quotex — {exc}",
+            "total_available": 0, "category_counts": {}, "assets": [],
+        }), 503
+
+    if not live:
+        return jsonify({
+            "success": False, "error": "Quotex returned no asset data (empty snapshot).",
+            "total_available": 0, "category_counts": {}, "assets": [],
+        }), 503
+
+    catalog = live_assets.build_catalog_snapshot(live_assets=live)
+    return jsonify({
+        "success": True,
+        "discovered_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        **catalog,
+    })
+
+
 @app.route("/api/scanner/status")
 def api_scanner_status():
     """Scanner lifecycle state, metrics, history, and recent events."""
@@ -1331,6 +1397,22 @@ def api_scanner_results():
     timeframe = request.args.get("timeframe", type=str)
     limit = request.args.get("limit", type=int)
     return jsonify(_scanner.get_results(min_confidence=min_confidence, timeframe=timeframe, limit=limit))
+
+
+@app.route("/api/scanner/recommendations")
+def api_scanner_recommendations():
+    """
+    Phase 12 — one dynamically-chosen best timeframe per asset, derived
+    entirely from data the scanner already computes every cycle for every
+    (asset, timeframe) it scans (no new scan path, no second signal
+    engine). See ScannerEngine.get_recommendations() for the exact
+    TRADE/WATCH/NOT_TRADE derivation — it only reuses existing fields
+    (mandatory_pass, confidence, filter_score, payout) and the scanner's
+    own existing confidence threshold; nothing is fabricated.
+    """
+    min_confidence = request.args.get("min_confidence", type=float)
+    limit = request.args.get("limit", type=int)
+    return jsonify(_scanner.get_recommendations(min_confidence=min_confidence, limit=limit))
 
 
 @app.route("/api/scanner/diagnostics")
