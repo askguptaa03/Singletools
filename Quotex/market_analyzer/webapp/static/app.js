@@ -243,7 +243,14 @@ function renderFilters(container, data) {
 
   const items = [
     { label: 'EMA 50', state: data.trend && trendWord(data.trend) !== 'Neutral' ? 'pass' : 'fail' },
-    { label: 'EMA 200', state: data.trend && trendWord(data.trend) !== 'Neutral' ? 'pass' : 'fail' },
+    // EMA 200 fix: previously duplicated the EMA 50 condition verbatim (and
+    // before that, duplicated Multi Timeframe) — neither reflected an actual
+    // EMA-200 value. Now uses the real ema_200 backend field crossed with
+    // price: pass = price is on the side of EMA-200 that matches the
+    // computed trend direction; fail = it disagrees; na = data unavailable.
+    { label: 'EMA 200', state: (ind.ema_200 != null && data.price != null && data.trend && trendWord(data.trend) !== 'Neutral')
+      ? ((trendWord(data.trend) === 'Bullish' && data.price > ind.ema_200) || (trendWord(data.trend) === 'Bearish' && data.price < ind.ema_200) ? 'pass' : 'fail')
+      : 'na' },
     { label: 'ADX > 25', state: ind.adx != null ? (ind.adx > 25 ? 'pass' : 'fail') : 'na' },
     { label: 'ATR', state: ind.atr_pct != null ? 'pass' : 'na' },
     { label: 'RSI', state: factors.rsi_div ? (factors.rsi_div.vote !== 'NEUTRAL' ? 'pass' : 'fail') : 'na' },
