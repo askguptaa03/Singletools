@@ -123,8 +123,17 @@ _FACTOR_LABELS = {
     "stoch": "Stochastic Cross",
     "cci": "CCI Extreme",
     "candle": "Candlestick",
+    "mean_reversion": "Mean Reversion",
+    "exhaustion": "Candle Exhaustion",
+    "round_number": "Round Number",
     "obv": "OBV Divergence",  # Step 4: new factor, additive only
     "sr": "Support/Resistance Zone",  # Phase 6: new factor, additive only
+    # Phase 7.3 Part 3, connected to confluence in Phase 8.6 — labels match
+    # webapp/indicator_registry.py's _INDICATOR_META names exactly. Reporting
+    # only: no change to vote calculation, weighting, or confluence logic.
+    "wick_rejection": "Wick Rejection",
+    "liquidity_sweep": "Liquidity Sweep",
+    "false_breakout": "False Breakout",
 }
 _VOTE_LABELS = {1: "BULLISH", -1: "BEARISH", 0: "NEUTRAL"}
 
@@ -206,6 +215,40 @@ def _check_live_asset(asset: str, timeframe: Optional[str] = None) -> Dict[str, 
             }
 
     return {"ok": True, "status": 200, "error": None}
+
+
+# ── Closed-candle helper ───────────────────────────────────────────────────────
+# Analysis (indicators/backtest/confluence/MTF) must only ever see fully
+# CLOSED candles. Quotex's most-recently-returned candle for a timeframe is
+# frequently still forming (its own period boundary hasn't passed yet), and
+# its OHLC can keep changing on every poll — using it as the analysis candle
+# would make repeated Analyze calls flip signal/entry-window data mid-candle
+# for no market reason. This does not touch /api/diagnostic (which reads
+# fetcher/transport state directly, never calls _run_pipeline()) and never
+# fabricates a timestamp — it only ever drops a real, already-fetched row.
+def _drop_forming_candle(df, timeframe: str):
+    """Return df with its last row removed if that row is still forming
+    (its period boundary has not yet passed). If df has only one row and
+    that row is still forming, it is kept as-is rather than emptying the
+    frame entirely — an analysis run on the best available (if slightly
+    forming) data beats no data at all in that edge case."""
+    if df is None or df.empty:
+        return df
+    tf_secs = _TF_SECONDS_MAP.get(timeframe)
+    if not tf_secs:
+        return df
+    try:
+        last_ts = df.index[-1]
+        last_ts = last_ts.to_pydatetime() if hasattr(last_ts, "to_pydatetime") else last_ts
+        if last_ts.tzinfo is None:
+            # Quotex candle timestamps are epoch-seconds derived (UTC).
+            last_ts = last_ts.replace(tzinfo=timezone.utc)
+    except Exception:
+        return df  # can't determine boundary — leave df untouched, never guess
+    boundary = last_ts + timedelta(seconds=tf_secs)
+    if boundary > datetime.now(timezone.utc) and len(df) > 1:
+        return df.iloc[:-1]
+    return df
 
 
 # ── Timing helpers ────────────────────────────────────────────────────────────
@@ -419,6 +462,12 @@ async def _run_pipeline(asset: str, timeframe: str) -> Dict[str, Any]:
                 "diagnostics": diag,
             }
 
+        # CLOSED CANDLE ONLY — drop the currently-forming candle before any
+        # indicator/backtest/confluence computation touches df. See
+        # _drop_forming_candle() docstring above (never empties a
+        # single-row frame, so df here is guaranteed non-empty).
+        df = _drop_forming_candle(df, timeframe)
+
         otc_settings = cfg.get_indicator_settings(asset)
         indicators = calculate_all(
             df,
@@ -498,6 +547,8 @@ async def _run_pipeline(asset: str, timeframe: str) -> Dict[str, Any]:
             df_cmp = await fetcher.get_candles_df(
                 asset=asset, timeframe=compare_tf, count=cfg.CANDLE_COUNT
             )
+            # CLOSED CANDLE ONLY — same rule as the primary timeframe above.
+            df_cmp = _drop_forming_candle(df_cmp, compare_tf)
             if not df_cmp.empty:
                 try:
                     ind_cmp = calculate_all(
@@ -561,6 +612,11 @@ async def _run_pipeline(asset: str, timeframe: str) -> Dict[str, Any]:
                 # Step 2: map the existing 3-way internal status onto the
                 # explicit CONFIRMED / DISAGREED / UNAVAILABLE vocabulary,
                 # purely for reporting — multi_tf_result above is untouched.
+                # PARTIAL (one side was WAIT) is a neutral "no confirmation
+                # available" outcome, not a genuine disagreement — CONFLICTING
+                # is the only case that actually disagreed, so only that one
+                # maps to DISAGREED. This does not change mt_status, the
+                # confidence math, or the primary signal in any way.
                 if mt_status == "CONFIRMED":
                     multi_tf_status = {
                         "status": "CONFIRMED",
@@ -575,7 +631,7 @@ async def _run_pipeline(asset: str, timeframe: str) -> Dict[str, Any]:
                     }
                 else:  # PARTIAL — one side had insufficient confirmation
                     multi_tf_status = {
-                        "status": "DISAGREED",
+                        "status": "UNAVAILABLE",
                         "reason": "Higher timeframe did not provide confirmation (WAIT)",
                         "timeframe_checked": compare_tf,
                     }
@@ -646,6 +702,14 @@ async def _run_pipeline(asset: str, timeframe: str) -> Dict[str, Any]:
                 "support_resistance_detail": indicators.get("support_resistance_detail"),
                 "atr_pct": indicators.get("atr_pct"),
                 "volatility_level": indicators.get("level"),
+                # EMA-200 filter fix: `calculate_all()` already computes this
+                # (cfg.EMA_PERIODS includes 200) but it was never exposed to
+                # the frontend, so the "EMA 200" filter pill had no real data
+                # to use and was reusing the EMA 50 pill's trend-word check
+                # instead. Smallest additive field — real EMA-200 value,
+                # nothing derived/faked. Signal/confluence calculation is
+                # untouched; this is a read-only reporting addition.
+                "ema_200": indicators.get("ema_200"),
             },
             # Task 3: payout % (None = unavailable or market closed)
             "payout_pct": round(payout_pct, 1) if payout_pct and payout_pct > 0 else None,
