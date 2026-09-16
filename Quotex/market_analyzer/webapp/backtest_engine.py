@@ -204,6 +204,15 @@ class BacktestEngine:
                     continue
 
                 candles_fetched = len(df)
+                # Honest data-count transparency, additive/diagnostic only —
+                # does not change candle_count_met or any gate. See
+                # _backtest_fetch_candles() in app.py for where these come
+                # from. df.attrs is best-effort; absence just falls back to
+                # the already-existing candles_fetched/candle_count values,
+                # i.e. exactly today's behavior.
+                _attrs = getattr(df, "attrs", {}) or {}
+                candles_requested_actual = _attrs.get("candles_requested", candle_count)
+                candles_returned_raw = _attrs.get("candles_returned_raw", candles_fetched)
 
                 # P0 fix — the compute stage (factor accuracy, dynamic
                 # weights, filter-score report) was previously unprotected:
@@ -249,6 +258,8 @@ class BacktestEngine:
                 self.results[asset] = {
                     "status": "SUCCESS",
                     "candles_used": candles_fetched,
+                    "candles_requested": candles_requested_actual,
+                    "candles_returned_raw": candles_returned_raw,
                     "accuracies": accuracies,
                     "suggested_weights": suggested_weights,
                     "filter_score_report": fs_report,

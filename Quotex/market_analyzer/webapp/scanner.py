@@ -77,12 +77,39 @@ class ScannerEngine:
         config: Optional[ScannerConfig] = None,
         settings_store: Optional[Any] = None,
         live_data_lock: Optional[Callable[[], "asyncio.Lock"]] = None,
+        check_asset_status: Optional[Callable[[str], Awaitable[str]]] = None,
+        refresh_assets: Optional[Callable[[], Awaitable[List[str]]]] = None,
     ) -> None:
         self._run_pipeline = run_pipeline
         self._assets = list(assets)
         self._invalidate_fetcher = invalidate_fetcher
         self._adx_trending = adx_trending
         self.cfg = config or ScannerConfig()
+
+        # Phase 15 (Part 1) — same live-open/closed safety check Manual
+        # Analyzer's /api/signal route applies (app.py's
+        # _get_live_asset_status()), so an actionable BUY/SELL result
+        # produced by the scanner carries the same freshness guarantee as
+        # one produced by a manual request — previously it did not (the
+        # scanner stored _run_pipeline()'s result as-is, with no
+        # asset_status field at all). Optional/duck-typed exactly like
+        # live_data_lock above: if None (e.g. an older caller/test), the
+        # scanner behaves exactly as it did before this addition — no new
+        # field, no new behavior, nothing to break.
+        self._check_asset_status = check_asset_status
+
+        # Phase 15 — safe cycle-boundary refresh (optional, duck-typed
+        # exactly like check_asset_status above). If None (default, or an
+        # older caller/test), behavior is EXACTLY what it was before this
+        # addition: _effective_assets is set once at start() and never
+        # touched again. If set, _scan_loop() calls it once at the START
+        # of each new cycle (never mid-cycle — see _scan_loop()) to build a
+        # brand-new list, which only replaces _effective_assets if the
+        # call actually succeeds AND returns a non-empty list; any
+        # exception, or an empty result, leaves the previous list
+        # untouched and is only logged — never fabricated, never silently
+        # swapped for a static fallback.
+        self._refresh_assets = refresh_assets
 
         # Part 3 approved fix — Analyzer priority over Scanner. Optional
         # getter (mirrors app.py's _get_shared_fetcher()/_fetcher_lock()
@@ -407,6 +434,40 @@ class ScannerEngine:
                 cycle_success = 0
                 cycle_failure = 0
 
+                # Phase 15 — safe cycle-boundary refresh. Runs exactly once
+                # here, BEFORE the asset loop below starts, and never again
+                # until the NEXT cycle_start — so the list this cycle
+                # iterates over (self._effective_assets) cannot change
+                # while the cycle is running, satisfying the same
+                # immutability guarantee as before this addition, just
+                # re-established fresh at each cycle boundary instead of
+                # only once at start().
+                if self._refresh_assets is not None:
+                    try:
+                        fresh_assets = await self._refresh_assets()
+                    except Exception as exc:
+                        fresh_assets = None
+                        self._log_event(
+                            "assets_refresh_failed",
+                            f"cycle={self.current_cycle} error={exc} — "
+                            f"keeping previous {len(self._effective_assets)} asset(s)",
+                        )
+                    if fresh_assets:
+                        self._effective_assets = list(fresh_assets)
+                        self._log_event(
+                            "assets_refreshed",
+                            f"cycle={self.current_cycle} count={len(self._effective_assets)}",
+                        )
+                    elif fresh_assets is not None:
+                        # Call succeeded but returned nothing — treat the
+                        # same as a failure for safety: never shrink the
+                        # scan to zero assets off a single empty response.
+                        self._log_event(
+                            "assets_refresh_empty",
+                            f"cycle={self.current_cycle} live universe returned empty — "
+                            f"keeping previous {len(self._effective_assets)} asset(s)",
+                        )
+
                 for asset in self._effective_assets:
                     if self._stop_requested:
                         break
@@ -452,6 +513,24 @@ class ScannerEngine:
 
                             if "error" in result:
                                 raise RuntimeError(result["error"])
+
+                            # Phase 15 (Part 1) — mirror app.py's
+                            # /api/signal asset_status re-check for the
+                            # scanner's own actionable results (see
+                            # check_asset_status= in __init__). Scoped
+                            # locally so a failure here can NEVER be
+                            # mistaken for a failed analysis attempt (it
+                            # would otherwise fall into the except Exception
+                            # block below and wrongly count as a scan
+                            # failure) — this is purely additive metadata,
+                            # signal/confidence/direction are untouched.
+                            if self._check_asset_status is not None:
+                                sig = (result.get("confluence") or {}).get("signal")
+                                if sig in ("BUY", "SELL"):
+                                    try:
+                                        result["asset_status"] = await self._check_asset_status(asset)
+                                    except Exception:
+                                        result["asset_status"] = "unknown"  # never guess/fabricate
 
                             self._store_result(asset, tf, result, duration)
                             # M1 — this attempt succeeded, so any earlier

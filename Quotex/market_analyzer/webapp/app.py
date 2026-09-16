@@ -417,6 +417,51 @@ def _invalidate_shared_fetcher() -> None:
             pass
 
 
+async def _get_live_asset_status(asset: str) -> str:
+    """
+    Shared, honest live-open/closed check — used by BOTH the Manual Analyzer
+    (/api/signal, below) and the Auto Scanner (scanner.py's ScannerEngine,
+    wired in via its optional check_asset_status= constructor callable) so
+    an actionable BUY/SELL result gets the exact same freshness guarantee
+    regardless of which path produced it. Never fabricates: any failure to
+    reach Quotex or resolve the asset returns "unknown", never "open".
+    Purely additive metadata — does not touch _run_pipeline(),
+    generate_confluence_signal(), or any signal/confidence computation.
+    """
+    try:
+        fetcher = await _get_shared_fetcher()
+        live_now = await live_assets.get_live_assets(fetcher)
+        info = (live_now or {}).get(asset)
+        return "open" if (info and info.get("is_open")) else "closed" if info else "unknown"
+    except Exception:
+        return "unknown"  # never guess/fabricate on failure
+
+
+async def _get_live_scanner_assets() -> List[str]:
+    """
+    Phase 15 — the SAME authoritative live snapshot + settings.enabled_assets
+    narrowing api_scanner_start() applies at start time, reused here so
+    ScannerEngine's cycle-boundary refresh (refresh_assets=) stays
+    consistent with what a fresh scanner start would produce — one
+    authoritative source, not a second independent asset list. Deliberately
+    raises on any failure rather than swallowing it: scanner.py's own
+    refresh_assets caller is responsible for deciding what happens on
+    failure (keep the previous list, log it — see _scan_loop()), so this
+    function never itself substitutes a static/fabricated list.
+    """
+    fetcher = await _get_shared_fetcher()
+    live_otc = await live_assets.get_live_otc_assets(fetcher, force_refresh=True)
+    live_symbols = set(live_otc.keys())
+    saved_selection = None
+    try:
+        saved_selection = (settings_store.get().get("scanner", {}) or {}).get("enabled_assets") or None
+    except Exception:
+        saved_selection = None
+    if saved_selection:
+        return [a for a in saved_selection if a in live_symbols]
+    return sorted(live_symbols)
+
+
 async def _run_pipeline(asset: str, timeframe: str) -> Dict[str, Any]:
     """
     Full analysis-only pipeline for one asset/timeframe:
@@ -435,7 +480,6 @@ async def _run_pipeline(asset: str, timeframe: str) -> Dict[str, Any]:
 
         df = await fetcher.get_candles_df(asset=asset, timeframe=timeframe, count=cfg.CANDLE_COUNT)
         t = _log_step(f"get_candles_df({timeframe})", t0, t)
-
         if df.empty:
             # Approved general fix — surface fetcher.last_fetch_diagnostics
             # instead of always returning the same generic string,
@@ -465,7 +509,12 @@ async def _run_pipeline(asset: str, timeframe: str) -> Dict[str, Any]:
         # CLOSED CANDLE ONLY — drop the currently-forming candle before any
         # indicator/backtest/confluence computation touches df. See
         # _drop_forming_candle() docstring above (never empties a
-        # single-row frame, so df here is guaranteed non-empty).
+        # single-row frame, so df here is guaranteed non-empty). Captured
+        # BEFORE trimming so the API can honestly report the distinction
+        # between what Quotex actually returned and what was usable —
+        # requested vs. returned-raw vs. closed/usable are three different
+        # numbers and must not be collapsed into one.
+        _candles_returned_raw = len(df)
         df = _drop_forming_candle(df, timeframe)
 
         otc_settings = cfg.get_indicator_settings(asset)
@@ -675,6 +724,17 @@ async def _run_pipeline(asset: str, timeframe: str) -> Dict[str, Any]:
             "is_otc": "_otc" in asset.lower(),
             "price": indicators.get("price"),
             "candle_count": len(df),
+            # Honest data-count transparency (see _drop_forming_candle()
+            # comment above): "requested" is what we asked the fetcher for;
+            # Quotex's own server decides how many it actually returns in a
+            # single response (our client has no working way to request
+            # more — see fetch_data.py/client.py for why), so
+            # "candles_returned_raw" can legitimately be less than
+            # requested; "candle_count" above is what's left after removing
+            # the still-forming candle, i.e. the usable/closed count. These
+            # are three different numbers and must not be conflated.
+            "candles_requested": cfg.CANDLE_COUNT,
+            "candles_returned_raw": _candles_returned_raw,
             "trend": indicators.get("direction"),
             "confluence": {
                 "signal": confluence["signal"],
@@ -779,27 +839,71 @@ async def _run_pipeline(asset: str, timeframe: str) -> Dict[str, Any]:
             _candle_start = None
 
         _next_boundary = None
+        _entry_window_unavailable_reason = None
+        # Max whole intervals we'll advance past the candle's own boundary
+        # before treating the data as too stale to trust for a real expiry
+        # projection. One interval covers the normal case (this closed
+        # candle's own boundary has just passed, project to the next one).
+        # A small allowance beyond that covers an unusually slow
+        # request/fetch round-trip. Anything beyond this is no longer
+        # "the actual candle timing", it's guessing how many intervals
+        # might have silently gone by — which CRITICAL CORRECTION #2
+        # explicitly forbids treating as a trustworthy real boundary.
+        _MAX_TRUSTWORTHY_ADVANCE_INTERVALS = 3
         if _tf_secs and _candle_start is not None:
-            # Preferred source: actual latest candle's start time + one
-            # timeframe interval = when that candle closes / the next
-            # candle begins. This is the "entry window" — not a Quotex
-            # trade-duration/option-expiry value (Part 3 distinction).
-            _next_boundary = _candle_start + timedelta(seconds=_tf_secs)
-        elif _tf_secs:
-            # Documented fallback (Part 4) — candle timestamp unavailable:
-            # align to the current-time grid instead. Clearly a fallback,
-            # not the preferred source; can be slightly off from the
-            # broker's actual candle boundary but avoids leaving the
-            # frontend with nothing to count down from.
-            _epoch_now = _now_utc.timestamp()
-            _next_epoch = (int(_epoch_now // _tf_secs) + 1) * _tf_secs
-            _next_boundary = datetime.fromtimestamp(_next_epoch, tz=timezone.utc)
+            # Preferred source: actual latest CLOSED candle's start time.
+            # BUG FIX (proven root cause of "Signal expired" appearing
+            # immediately after a fresh analysis): df's last row is now
+            # always the latest CLOSED candle (see _drop_forming_candle()
+            # above) — its own boundary (_candle_start + one interval) has,
+            # by definition, already passed by the time this code runs, so
+            # using it directly as entry_window_end produced a timestamp
+            # already in the past. The actionable entry window is really
+            # "until the CURRENTLY-FORMING candle closes" — i.e. the next
+            # boundary strictly AFTER now, not the boundary that already
+            # closed. Advancing by whole timeframe intervals until the
+            # result is genuinely in the future keeps this 100% derived
+            # from the real candle timestamp (never fabricated) — but only
+            # up to _MAX_TRUSTWORTHY_ADVANCE_INTERVALS; beyond that we no
+            # longer have sufficiently current/trustworthy candle data to
+            # honestly claim a real broker boundary (CORRECTION #2), so we
+            # report unavailable instead of extrapolating indefinitely.
+            _candidate = _candle_start + timedelta(seconds=_tf_secs)
+            _advances = 1
+            while _candidate <= _now_utc:
+                if _advances >= _MAX_TRUSTWORTHY_ADVANCE_INTERVALS:
+                    _candidate = None
+                    _entry_window_unavailable_reason = "stale_candle_timing"
+                    break
+                _candidate += timedelta(seconds=_tf_secs)
+                _advances += 1
+            _next_boundary = _candidate
+        # CORRECTION #1: no current-time-grid fallback. If the candle
+        # timestamp itself is unavailable, entry_window_end must be None
+        # and entry_window_source must be "unavailable" — never a boundary
+        # derived from datetime.now() / page-load time / request time.
+        # There is no other source of truth for a real broker candle
+        # boundary than the actual candle timestamp; without it, honesty
+        # requires reporting "unavailable", not guessing.
 
         result["candle_start"] = _candle_start.isoformat() if _candle_start else None
         result["entry_window_end"] = _next_boundary.isoformat() if _next_boundary else None
-        result["entry_window_source"] = "candle_timestamp" if _candle_start is not None else (
-            "current_time_fallback" if _next_boundary is not None else None
-        )
+        if _next_boundary is not None:
+            result["entry_window_source"] = "candle_timestamp"
+            result["entry_window_unavailable_reason"] = None
+        else:
+            result["entry_window_source"] = "unavailable"
+            # Honest, additive diagnostic — why entry_window_end is None:
+            # "stale_candle_timing" (candle too old to trust, CORRECTION #2),
+            # "no_candle_timestamp" (df empty/unparsable), or
+            # "unknown_timeframe" (timeframe not in _TF_SECONDS_MAP at all).
+            # Never affects signal generation; purely for transparency.
+            if not _tf_secs:
+                result["entry_window_unavailable_reason"] = "unknown_timeframe"
+            elif _entry_window_unavailable_reason:
+                result["entry_window_unavailable_reason"] = _entry_window_unavailable_reason
+            else:
+                result["entry_window_unavailable_reason"] = "no_candle_timestamp"
 
         print(f"[PERF] ── pipeline done  total={_ts() - t0:.2f}s ──\n")
         return result
@@ -841,6 +945,18 @@ _scanner = ScannerEngine(
     # own lazy-creation pattern, so the Lock is only ever constructed
     # from inside the running _BG_LOOP, never at import time.
     live_data_lock=_live_data_lock,
+    # Phase 15 (Part 1) — same live-open/closed check Manual Analyzer's
+    # /api/signal route applies to its own actionable results (see
+    # _get_live_asset_status() above). Passing the coroutine function
+    # itself (not calling it) — scanner.py awaits it directly since it
+    # already runs on the same shared background loop.
+    check_asset_status=_get_live_asset_status,
+    # Phase 15 — cycle-boundary refresh (see ScannerEngine._scan_loop()):
+    # reuses the exact same authoritative live-snapshot helper
+    # /api/scanner/start already uses, so a long-running scan re-syncs
+    # against Quotex's current live availability once per cycle rather
+    # than only ever using the snapshot taken at start() time.
+    refresh_assets=_get_live_scanner_assets,
 )
 
 
@@ -849,7 +965,28 @@ _scanner = ScannerEngine(
 # — this does not open a second Quotex connection path.
 async def _backtest_fetch_candles(asset: str, timeframe: str, count: int):
     fetcher = await _get_shared_fetcher()
-    return await fetcher.get_candles_df(asset=asset, timeframe=timeframe, count=count)
+    df = await fetcher.get_candles_df(asset=asset, timeframe=timeframe, count=count)
+    # CLOSED CANDLE ONLY — same rule _run_pipeline() applies to primary/MTF
+    # analysis (see _drop_forming_candle() above). Previously this backtest
+    # fetch path did not apply it, so candles_fetched/candle_count_met in
+    # backtest_engine.py could include a still-forming candle, inconsistent
+    # with the closed-candle guarantee everywhere else. This can only ever
+    # remove at most the single already-forming last row (same guarantees:
+    # never empties a one-row frame, never touches df on an unknown
+    # timeframe or unparsable timestamp) — it does not change what counts
+    # as a "requested" or "returned" candle, only what counts as "usable".
+    candles_returned_raw = len(df)
+    df = _drop_forming_candle(df, timeframe)
+    # Diagnostics only — never load-bearing. df.attrs is a best-effort
+    # pandas side-channel; if it's ever unavailable for any reason,
+    # backtest_engine.py falls back to len(df) and the requested count,
+    # which is exactly what it already did before this change.
+    try:
+        df.attrs["candles_requested"] = count
+        df.attrs["candles_returned_raw"] = candles_returned_raw
+    except Exception:
+        pass
+    return df
 
 
 _backtest_engine = BacktestEngine(fetch_candles=_backtest_fetch_candles)
@@ -1095,14 +1232,14 @@ def api_signal():
     # never altered here. The frontend is responsible for using this field
     # to withhold an actionable TRADE presentation for a closed asset
     # (Part 2) — this endpoint only supplies the honest, freshly-checked
-    # fact, never fabricates or guesses it.
+    # fact, never fabricates or guesses it. Uses the SAME helper the
+    # scanner now uses (see _get_live_asset_status() above and
+    # ScannerEngine's check_asset_status= wiring below), so Manual Analyzer
+    # and Auto Scanner apply identical live-freshness logic.
     sig = (result.get("confluence") or {}).get("signal")
     if sig in ("BUY", "SELL"):
         try:
-            fetcher = _run_bg(_get_shared_fetcher(), timeout=10.0)
-            live_now = _run_bg(live_assets.get_live_assets(fetcher), timeout=10.0)
-            info = (live_now or {}).get(asset)
-            result["asset_status"] = "open" if (info and info.get("is_open")) else "closed" if info else "unknown"
+            result["asset_status"] = _run_bg(_get_live_asset_status(asset), timeout=10.0)
         except Exception:
             result["asset_status"] = "unknown"  # never guess/fabricate on failure
     return jsonify(result)
