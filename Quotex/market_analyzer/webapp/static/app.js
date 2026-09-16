@@ -438,7 +438,14 @@ function fillSignalCard(card, data, opts = {}) {
       _renderCountdownInto(ewEl, data.entry_window_end);
     } else {
       delete ewEl.dataset.entryWindowEnd;
-      ewEl.textContent = '—';
+      // CORRECTION #1: an actionable BUY/SELL with no real candle-derived
+      // expiry (entry_window_source === "unavailable" — backend could not
+      // establish a trustworthy broker candle boundary) must say so
+      // honestly rather than showing a bare dash that could be misread as
+      // "not applicable". WAIT still shows the plain dash — it never had
+      // a countdown concept to begin with, so there's nothing to call
+      // "unavailable".
+      ewEl.textContent = (sig !== 'WAIT') ? 'Countdown unavailable' : '—';
       ewEl.classList.remove('countdown-expired');
     }
   }
@@ -510,16 +517,50 @@ function enqueueSignalRequest(asset, timeframe, timeoutMs = REQUEST_TIMEOUT_MS) 
  * Connection indicator (via existing /healthz)
  * ──────────────────────────────────────────────────────────────────────────── */
 
+/* ────────────────────────────────────────────────────────────────────────────
+ * Connection indicator (via existing /healthz + /api/session/status)
+ * "Connecting to Quotex" / "Connected" / failure state — /healthz only ever
+ * proved the Flask process itself was reachable, never whether the actual
+ * Quotex WebSocket session was up. /api/session/status already exposes a
+ * real, non-fabricated check of that (fetcher_connected, backed by
+ * _fetcher_is_alive()'s live websocket_is_connected probe) — this reuses
+ * the SAME existing 20s interval (no second timer) to also poll it and
+ * reflect real state on the same existing dot, via its title tooltip and
+ * an added 'connecting' class alongside the pre-existing online/offline.
+ * ──────────────────────────────────────────────────────────────────────────── */
+
 async function pingHealth() {
   const el = $('conn-indicator');
+  let flaskOk = false;
   try {
     const res = await fetch('/healthz', { cache: 'no-store' });
-    el.classList.toggle('online', res.ok);
-    el.classList.toggle('offline', !res.ok);
+    flaskOk = res.ok;
   } catch (_) {
-    el.classList.remove('online');
-    el.classList.add('offline');
+    flaskOk = false;
   }
+
+  if (!flaskOk) {
+    el.classList.remove('online', 'connecting');
+    el.classList.add('offline');
+    el.title = 'Connection status: server unreachable';
+    return;
+  }
+
+  let quotexConnected = false;
+  try {
+    const sRes = await fetch('/api/session/status', { cache: 'no-store' });
+    const sData = await sRes.json();
+    quotexConnected = !!sData.fetcher_connected;
+  } catch (_) {
+    // Flask is reachable but the session-status probe itself failed —
+    // treat as "connecting" (honest unknown), never fabricate "connected".
+    quotexConnected = false;
+  }
+
+  el.classList.toggle('online', quotexConnected);
+  el.classList.toggle('connecting', !quotexConnected);
+  el.classList.remove('offline');
+  el.title = quotexConnected ? 'Connection status: Connected to Quotex' : 'Connection status: Connecting to Quotex…';
 }
 pingHealth();
 setInterval(pingHealth, 20000);
@@ -603,15 +644,27 @@ function renderNotifPanel() {
     list.innerHTML = '<div class="tab-empty small">No signals yet — run a scan to populate this feed.</div>';
     return;
   }
-  list.innerHTML = _notifFeed.map((n, idx) => `
+  list.innerHTML = _notifFeed.map((n, idx) => {
+    // Reuses the SAME shared absolute-timestamp ticker every other
+    // countdown on the page already uses (_tickAllCountdowns() above,
+    // which queries [data-entry-window-end] globally) — no second timer,
+    // no independently-computed value. If this notification has no
+    // entry_window_end (e.g. an older in-memory entry from before this
+    // field existed), no countdown is shown at all rather than fabricating one.
+    const countdownHtml = n.entry_window_end
+      ? `<span class="notif-countdown" data-entry-window-end="${n.entry_window_end}" data-countdown-kind="row">--:--</span>`
+      : '';
+    return `
     <div class="notif-row" data-idx="${idx}">
       <div class="notif-row-left">
         <span class="notif-asset">${fmtLabel(n.asset)}</span>
         <span class="notif-time">${timeAgo(n.ts)}</span>
       </div>
+      ${countdownHtml}
       <span class="dir-chip ${n.signal.toLowerCase()}">${n.signal} ${n.confidence}%</span>
     </div>
-  `).join('');
+  `;
+  }).join('');
   bindNotifRowClicks(list, _notifFeed);
 }
 
@@ -893,6 +946,21 @@ async function runScan() {
     const res = await enqueueSignalRequest(asset, SCAN_TIMEFRAME, REQUEST_TIMEOUT_MS);
     if (res.ok) {
       results.push(res.data);
+      // Incremental render (Part 6 fix): previously this asset's result
+      // only became visible after the ENTIRE SCAN_LIST finished (a single
+      // renderScanResults() call at the very end, below) — a user watching
+      // the Auto Scanner tab saw nothing update until the whole cycle
+      // completed. renderScanResults() already safely re-renders from
+      // whatever `results` contains so far (it filters/sorts internally,
+      // nothing here is append-only or order-sensitive), so calling it
+      // again here is genuinely incremental — not simulated/fake
+      // streaming — using the exact same sequential, already-existing
+      // request flow (enqueueSignalRequest's single-flight _requestChain).
+      // _lastScanResults is also kept in sync so anything reading it
+      // mid-scan (e.g. the full signals list) reflects real progress
+      // rather than an empty/stale array until the cycle finishes.
+      _lastScanResults = results;
+      renderScanResults(results);
       // Fix 1 (Phase 8): don't pollute History with WAIT — same signal
       // check pushNotification() already uses.
       if ((res.data.confluence || {}).signal !== 'WAIT') {
@@ -1699,6 +1767,36 @@ function btRenderResults(payload) {
     return `<tr><td>${k}</td><td>${w.toFixed(2)}</td><td>${sample}</td></tr>`;
   }).join('');
 
+  // Honest per-asset candle-count diagnostic (Part 10 fix): payload.results
+  // already carries candles_requested/candles_returned_raw/candles_used/
+  // candle_count_met per asset (backend-only addition from an earlier
+  // round in this project — see backtest_engine.py); it just wasn't
+  // rendered anywhere yet. Shows the REAL reason "Apply" is blocked when
+  // it is — e.g. Quotex only returned ~200 of the 2000 requested — rather
+  // than leaving the user with only the aggregate reasons list. Nothing
+  // here is fabricated: every number is exactly what the backend already
+  // measured; if a field is missing for any asset, the cell shows "—",
+  // never a guessed value.
+  const perAssetResults = payload.results || {};
+  const diagRows = Object.entries(perAssetResults).map(([asset, r]) => {
+    if (!r || r.status !== 'SUCCESS') {
+      return `<tr><td>${asset}</td><td colspan="4">${(r && r.status) || 'FAILED'}${r && r.error ? ' — ' + r.error : ''}</td></tr>`;
+    }
+    const req = r.candles_requested != null ? r.candles_requested : '—';
+    const raw = r.candles_returned_raw != null ? r.candles_returned_raw : '—';
+    const used = r.candles_used != null ? r.candles_used : '—';
+    const met = r.candle_count_met ? '✓' : '✗';
+    return `<tr><td>${asset}</td><td>${req}</td><td>${raw}</td><td>${used}</td><td>${met}</td></tr>`;
+  }).join('');
+  const diagTable = diagRows ? `
+    <details class="bt-candle-diagnostics" style="margin-top:10px;">
+      <summary>Per-asset candle diagnostics</summary>
+      <table class="bt-suggested-table">
+        <thead><tr><th>Asset</th><th>Requested</th><th>Returned (raw)</th><th>Usable (closed)</th><th>Met ${summary.candle_count_target}?</th></tr></thead>
+        <tbody>${diagRows}</tbody>
+      </table>
+    </details>` : '';
+
   slot.innerHTML = `
     <div class="bt-results-summary">
       <span>Assets backtested: <b>${summary.assets_backtested}</b></span>
@@ -1706,6 +1804,7 @@ function btRenderResults(payload) {
       <span>Candle target: <b>${summary.candle_count_target}</b></span>
       <span>All met candle count: <b>${summary.all_assets_met_candle_count ? 'Yes' : 'No'}</b></span>
     </div>
+    ${diagTable}
     <table class="bt-suggested-table">
       <thead><tr><th>Factor</th><th>Suggested Weight</th><th>Min Sample Size</th></tr></thead>
       <tbody>${rows}</tbody>

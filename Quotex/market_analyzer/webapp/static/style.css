@@ -143,6 +143,8 @@ body {
 .conn-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--text-muted); transition: background var(--t), box-shadow var(--t); }
 .conn-indicator.online .conn-dot  { background: var(--accent); box-shadow: 0 0 9px rgba(5, 150, 105,0.7); }
 .conn-indicator.offline .conn-dot { background: var(--sell);   box-shadow: 0 0 9px rgba(220, 38, 38,0.7); }
+.conn-indicator.connecting .conn-dot { background: var(--wait); box-shadow: 0 0 9px rgba(217, 119, 6,0.7); animation: connPulse 1.4s ease-in-out infinite; }
+@keyframes connPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
 
 /* ── Drawer ──────────────────────────────────────────────────────────────── */
 .drawer-overlay {
@@ -200,6 +202,8 @@ body {
 .notif-row-left { display: flex; flex-direction: column; gap: 2px; }
 .notif-asset { font-size: 13px; font-weight: 700; }
 .notif-time { font-size: 10px; color: var(--text-muted); }
+.notif-countdown { font-size: 11px; font-weight: 600; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.notif-countdown.countdown-expired { color: var(--sell); }
 
 /* ── Layout ──────────────────────────────────────────────────────────────── */
 .app-main {
