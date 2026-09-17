@@ -2009,6 +2009,70 @@ def api_backtest_apply_weights():
     return jsonify({"ok": True, "settings": updated})
 
 
+@app.route("/api/backtest/save-weights", methods=["POST"])
+def api_backtest_save_weights():
+    """
+    Phase 17 Step 1 — manual weight editor Save. Deliberately independent
+    of evaluate_apply_conditions()/the 2000-candle & 100-sample gates above:
+    per the explicit requirement, "weight editing and backtest-data
+    eligibility are separate concerns" — a user hand-tuning weights is not
+    claiming a fresh backtest satisfied those statistical minimums, so this
+    route never checks them. What IS still enforced, server-side (never
+    trust the client alone): exactly the 13 real confluence factor keys —
+    no more, no fewer, nothing renamed — and the weights must sum to
+    100 (within a tiny float tolerance) with no negative value, mirroring
+    the same total-must-equal-100 invariant DEFAULT_CONFLUENCE_WEIGHTS
+    itself already guarantees. Reuses the exact same, already-existing
+    settings_store.apply_suggested_weights() persistence path the
+    Apply-Suggested-Weights route above uses — no second settings system,
+    no duplicated write logic — just a different (manual) source for the
+    weights dict and a different `reason` tag in the backup.
+    """
+    data = request.get_json(silent=True) or {}
+    weights = data.get("weights")
+    if not isinstance(weights, dict):
+        return jsonify({"ok": False, "reasons": ["Request body must include a 'weights' object."]}), 400
+
+    expected_keys = set(DEFAULT_CONFLUENCE_WEIGHTS.keys())  # the authoritative 13 — never redefined here
+    got_keys = set(weights.keys())
+    if got_keys != expected_keys:
+        missing = sorted(expected_keys - got_keys)
+        extra = sorted(got_keys - expected_keys)
+        reasons = []
+        if missing:
+            reasons.append(f"Missing factor(s): {', '.join(missing)}")
+        if extra:
+            reasons.append(f"Unknown factor(s): {', '.join(extra)}")
+        return jsonify({"ok": False, "reasons": reasons}), 400
+
+    parsed: Dict[str, float] = {}
+    for k, v in weights.items():
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "reasons": [f"Weight for '{k}' is not a number."]}), 400
+        if fv < 0:
+            return jsonify({"ok": False, "reasons": [f"Weight for '{k}' cannot be negative."]}), 400
+        parsed[k] = fv
+
+    total = sum(parsed.values())
+    if abs(total - 100.0) > 0.05:
+        return jsonify({
+            "ok": False,
+            "reasons": [f"Total weight must equal 100 (got {total:.2f})."],
+        }), 400
+
+    updated = settings_store.apply_suggested_weights(parsed, reason="manual_edit")
+    # Read back from the store (not just the in-memory `parsed`) so the
+    # response honestly reflects what was actually persisted to disk.
+    saved_weights = {
+        k: updated["indicators"][k]["weight"]
+        for k in expected_keys
+        if k in updated.get("indicators", {})
+    }
+    return jsonify({"ok": True, "settings": updated, "weights": saved_weights})
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Phase 8.4.3 — Validation Routes
 # Thin HTTP wrappers around validation_engine.py's ValidationEngine, mirroring
