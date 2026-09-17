@@ -797,6 +797,15 @@ body {
 .bt-suggested-table th { text-align: left; color: var(--text-muted); font-weight: 700; font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; padding: 6px 8px; border-bottom: 1px solid var(--panel-b); }
 .bt-suggested-table td { padding: 8px; border-bottom: 1px solid rgba(15,23,42,0.058); font-family: var(--mono); }
 .bt-suggested-table td:first-child { font-family: var(--sans); font-weight: 600; }
+.bt-weight-input {
+  width: 72px; font-family: var(--mono); font-size: 12px; padding: 4px 6px;
+  border: 1px solid var(--panel-b); border-radius: var(--r-sm); background: var(--card-bg, #fff);
+}
+.bt-weight-input.bt-weight-invalid { border-color: var(--sell); }
+.bt-weight-total-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; font-size: 13px; }
+.bt-weight-total-row .generate-btn { margin-top: 0; width: auto; padding: 8px 18px; }
+#bt-weight-total.bt-weight-total-ok { color: var(--accent); }
+#bt-weight-total.bt-weight-total-bad { color: var(--sell); }
 
 /* Phase 8.2 — Smart Scanner page (mirrors the .bt-* progress/table patterns above) */
 .ss-controls-row { display: flex; flex-wrap: wrap; gap: 8px; }

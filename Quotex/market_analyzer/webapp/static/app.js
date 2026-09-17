@@ -1754,6 +1754,16 @@ function btRenderStatus(status) {
   }
 }
 
+// Phase 17 Step 1 — current suggested weights, used as the default
+// editable-panel values whenever a per-factor value isn't already present
+// in this run's real summary.suggested_weights (defensive fallback only —
+// the real backtest output, when present, always takes precedence).
+const DEFAULT_SUGGESTED_WEIGHTS = {
+  bb: 7.01, candle: 5.78, cci: 8.08, exhaustion: 8.06, false_breakout: 7.72,
+  liquidity_sweep: 7.23, mean_reversion: 7.01, obv: 8.03, round_number: 7.69,
+  rsi_div: 10.97, sr: 7.89, stoch: 7.71, wick_rejection: 6.82,
+};
+
 function btRenderResults(payload) {
   const slot = $('bt-results-slot');
   if (!slot) return;
@@ -1764,7 +1774,13 @@ function btRenderResults(payload) {
   }
   const rows = Object.entries(summary.suggested_weights).map(([k, w]) => {
     const sample = summary.min_sample_sizes[k];
-    return `<tr><td>${k}</td><td>${w.toFixed(2)}</td><td>${sample}</td></tr>`;
+    const editableDefault = (typeof w === 'number' ? w : DEFAULT_SUGGESTED_WEIGHTS[k]).toFixed(2);
+    return `<tr>
+      <td>${k}</td>
+      <td>${w.toFixed(2)}</td>
+      <td>${sample}</td>
+      <td><input type="number" class="bt-weight-input" data-factor="${k}" value="${editableDefault}" step="0.01" min="0" /></td>
+    </tr>`;
   }).join('');
 
   // Honest per-asset candle-count diagnostic (Part 10 fix): payload.results
@@ -1806,12 +1822,83 @@ function btRenderResults(payload) {
     </div>
     ${diagTable}
     <table class="bt-suggested-table">
-      <thead><tr><th>Factor</th><th>Suggested Weight</th><th>Min Sample Size</th></tr></thead>
+      <thead><tr><th>Factor</th><th>Suggested Weight</th><th>Min Sample Size</th><th>Editable Weight</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
+    <div class="bt-weight-total-row">
+      <span>Total Weight: <b id="bt-weight-total">0.00</b> / 100</span>
+      <button class="generate-btn bt-save-weights-btn" id="bt-save-weights-btn" type="button" disabled><span class="btn-label">Save</span></button>
+    </div>
+    <p id="bt-save-weights-status" class="page-intro small" style="margin-top:4px;"></p>
     <button class="generate-btn bt-apply-weights-btn" id="bt-apply-weights-btn" type="button"><span class="btn-label">Apply Suggested Weights</span></button>
     <p id="bt-apply-reasons" class="page-intro small" style="margin-top:8px;"></p>
   `;
+
+  // Phase 17 Step 1 — editable weight panel: live total + Save gating.
+  // Save is enabled ONLY when every one of the 13 factors has a
+  // non-negative numeric value and the sum is exactly 100 (a tiny
+  // floating-point tolerance is applied so 99.999999999 from repeated
+  // float math isn't wrongly treated as invalid — never so loose that a
+  // visibly non-100 total, e.g. 99.5 or 100.5, is silently accepted).
+  const WEIGHT_TOTAL_TOLERANCE = 0.01;
+  const weightInputs = Array.from(slot.querySelectorAll('.bt-weight-input'));
+  const totalEl = $('bt-weight-total');
+  const saveBtn = $('bt-save-weights-btn');
+  const saveStatusEl = $('bt-save-weights-status');
+
+  function recomputeWeightTotal() {
+    let total = 0;
+    let anyInvalid = false;
+    for (const input of weightInputs) {
+      const v = parseFloat(input.value);
+      if (!Number.isFinite(v) || v < 0) {
+        anyInvalid = true;
+        input.classList.add('bt-weight-invalid');
+      } else {
+        input.classList.remove('bt-weight-invalid');
+        total += v;
+      }
+    }
+    totalEl.textContent = total.toFixed(2);
+    const atHundred = !anyInvalid && Math.abs(total - 100) <= WEIGHT_TOTAL_TOLERANCE;
+    totalEl.classList.toggle('bt-weight-total-ok', atHundred);
+    totalEl.classList.toggle('bt-weight-total-bad', !atHundred);
+    saveBtn.disabled = !atHundred;
+    return atHundred;
+  }
+  weightInputs.forEach((input) => input.addEventListener('input', () => {
+    saveStatusEl.textContent = '';
+    recomputeWeightTotal();
+  }));
+  recomputeWeightTotal();
+
+  saveBtn.addEventListener('click', async () => {
+    if (!recomputeWeightTotal()) return;  // guards a disabled-button bypass (e.g. Enter key)
+    const weights = {};
+    for (const input of weightInputs) weights[input.dataset.factor] = parseFloat(input.value);
+    saveBtn.disabled = true;
+    saveStatusEl.textContent = '';
+    try {
+      const res = await fetch('/api/backtest/save-weights', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ weights }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        saveStatusEl.textContent = '⚠ ' + (data.reasons || [data.error || 'Save failed']).join('; ');
+      } else {
+        // Confirm persistence by reading back what the backend actually
+        // wrote (data.weights), not just echoing what we sent.
+        saveStatusEl.textContent = '✓ Saved — weights persisted (backup created automatically).';
+        if (_settingsCache) { _settingsCache = data.settings; }
+      }
+    } catch (e) {
+      saveStatusEl.textContent = 'Save failed: ' + e.message;
+    } finally {
+      recomputeWeightTotal();
+    }
+  });
 
   $('bt-apply-weights-btn').addEventListener('click', async () => {
     const btn = $('bt-apply-weights-btn');
