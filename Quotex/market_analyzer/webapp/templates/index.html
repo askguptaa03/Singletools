@@ -276,6 +276,24 @@
             {% endfor %}
           </select>
 
+          <div class="glass-card" style="margin:12px 0;padding:12px;">
+            <div class="panel-title" style="margin-bottom:10px;">Master Engine</div>
+            <label class="field-label" for="man-master-mode">Mode</label>
+            <select id="man-master-mode" class="field-select">
+              <option value="adaptive">Adaptive</option>
+              <option value="selected-strategy">Selected Strategy</option>
+              <option value="13-factor">13-Factor</option>
+            </select>
+            <label class="field-label" for="man-master-quality">Quality</label>
+            <select id="man-master-quality" class="field-select">
+              <option value="strict">Strict</option>
+              <option value="balanced" selected>Balanced</option>
+              <option value="opportunity">Opportunity</option>
+            </select>
+            <label class="field-label" for="man-master-strategy">Strategy</label>
+            <select id="man-master-strategy" class="field-select"></select>
+          </div>
+
           <label class="field-label" for="man-expiry">Expiry</label>
           <select id="man-expiry" class="field-select">
             <option value="30 Seconds">30 Seconds</option>
