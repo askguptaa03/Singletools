@@ -56,6 +56,12 @@ from adaptive_calibration import (
 )
 from api_quotex.constants import ASSETS, TIMEFRAMES as _TF_SECONDS_MAP
 from scanner import ScannerEngine, ScannerConfig
+from master_engine import (
+    analyze as analyze_master,
+    strategy_catalog as master_strategy_catalog,
+    ANALYSIS_MODES as MASTER_ANALYSIS_MODES,
+    QUALITY_MODES as MASTER_QUALITY_MODES,
+)
 
 # Phase 7.4 — Settings Store / Backtest Engine / Indicator Registry.
 # Purely additive infrastructure: none of these modules touch analyzer.py,
@@ -116,6 +122,12 @@ import asset_timeframe_learning as _asset_timeframe_learning
 app = Flask(__name__)
 
 TIMEFRAMES = ["30s", "1m", "2m", "3m", "5m", "10m", "15m", "30m", "45m", "1h"]
+
+_MASTER_CONFIG = {
+    "mode": "adaptive",
+    "strategy": None,
+    "quality_mode": "balanced",
+}
 
 _FACTOR_LABELS = {
     "bb": "BB Bounce",
@@ -338,7 +350,13 @@ def _live_data_lock() -> asyncio.Lock:
     return _live_data_alock
 
 
-async def _run_pipeline_with_priority(asset: str, timeframe: str) -> Dict[str, Any]:
+async def _run_pipeline_with_priority(
+    asset: str,
+    timeframe: str,
+    master_mode: Optional[str] = None,
+    master_strategy: Optional[str] = None,
+    quality_mode: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Thin wrapper used ONLY by manual /api/signal requests: acquires the
     shared live-data lock (see _live_data_lock() above) and then calls
@@ -347,7 +365,9 @@ async def _run_pipeline_with_priority(asset: str, timeframe: str) -> Dict[str, A
     without altering _run_pipeline()'s own logic at all.
     """
     async with _live_data_lock():
-        return await _run_pipeline(asset, timeframe)
+        return await _run_pipeline(
+            asset, timeframe, master_mode, master_strategy, quality_mode
+        )
 
 
 def _fetcher_is_alive() -> bool:
@@ -462,7 +482,13 @@ async def _get_live_scanner_assets() -> List[str]:
     return sorted(live_symbols)
 
 
-async def _run_pipeline(asset: str, timeframe: str) -> Dict[str, Any]:
+async def _run_pipeline(
+    asset: str,
+    timeframe: str,
+    master_mode: Optional[str] = None,
+    master_strategy: Optional[str] = None,
+    quality_mode: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Full analysis-only pipeline for one asset/timeframe:
       connect -> fetch candles -> indicators (OTC-tuned if applicable)
@@ -905,6 +931,43 @@ async def _run_pipeline(asset: str, timeframe: str) -> Dict[str, Any]:
             else:
                 result["entry_window_unavailable_reason"] = "no_candle_timestamp"
 
+        _master_cfg = dict(_MASTER_CONFIG)
+        if master_mode is not None:
+            _master_cfg["mode"] = master_mode
+        if master_strategy is not None:
+            _master_cfg["strategy"] = master_strategy
+        if quality_mode is not None:
+            _master_cfg["quality_mode"] = quality_mode
+
+        try:
+            master_analysis = analyze_master(
+                df=df,
+                indicators=indicators,
+                timeframe=timeframe,
+                mode=_master_cfg.get("mode", "adaptive"),
+                strategy=_master_cfg.get("strategy"),
+                quality_mode=_master_cfg.get("quality_mode", "balanced"),
+                asset=asset,
+                mtf=multi_tf_result,
+            )
+        except Exception:
+            master_analysis = {
+                "signal": "WAIT",
+                "confidence_score": 0,
+                "strategy": None,
+                "strategy_label": "Master Engine unavailable",
+                "mode": _master_cfg.get("mode", "adaptive"),
+                "quality_mode": _master_cfg.get("quality_mode", "balanced"),
+                "confirmations": [],
+                "reasons": [],
+                "wait_reason": "Master Engine analysis unavailable",
+                "chart_reading": {},
+                "playbooks": [],
+                "confidence_basis": [],
+                "historical_evidence_used": False,
+            }
+        result["master_analysis"] = master_analysis
+
         print(f"[PERF] ── pipeline done  total={_ts() - t0:.2f}s ──\n")
         return result
     except (ConnectionError, OSError, RuntimeError) as e:
@@ -1174,6 +1237,9 @@ def api_signal():
     data = request.get_json(silent=True) or {}
     asset = str(data.get("asset", cfg.DEFAULT_ASSET))
     timeframe = str(data.get("timeframe", cfg.PRIMARY_TIMEFRAME))
+    master_mode = data.get("master_mode")
+    master_strategy = data.get("master_strategy")
+    quality_mode = data.get("quality_mode")
 
     if timeframe not in TIMEFRAMES:
         return jsonify({"error": f"Invalid timeframe '{timeframe}'. Must be one of {TIMEFRAMES}."}), 400
@@ -1197,7 +1263,9 @@ def api_signal():
             # directly, so this manual request and any in-progress/upcoming
             # Scanner fetch are never simultaneously in-flight. _run_pipeline()
             # itself is unchanged; only how it's invoked here changed.
-            result = _run_bg(_run_pipeline_with_priority(asset, timeframe))
+            result = _run_bg(_run_pipeline_with_priority(
+                asset, timeframe, master_mode, master_strategy, quality_mode
+            ))
         finally:
             _scanner.manual_request_finished()
     except FileNotFoundError as e:
@@ -1436,6 +1504,43 @@ async def _fetch_current_prices(assets: list) -> dict:
     await asyncio.gather(*(_fetch_one(a) for a in assets))
     return result
 
+
+
+@app.route("/api/master/config", methods=["GET", "POST"])
+def api_master_config():
+    """Read/update the shared Master Analyzer/Scanner configuration."""
+    global _MASTER_CONFIG
+    if request.method == "GET":
+        return jsonify({
+            **_MASTER_CONFIG,
+            "modes": list(MASTER_ANALYSIS_MODES),
+            "quality_modes": list(MASTER_QUALITY_MODES),
+            "strategies": master_strategy_catalog(),
+        })
+
+    data = request.get_json(silent=True) or {}
+    mode = str(data.get("mode", _MASTER_CONFIG["mode"])).lower()
+    quality = str(data.get("quality_mode", _MASTER_CONFIG["quality_mode"])).lower()
+    strategy = data.get("strategy") or None
+
+    if mode not in MASTER_ANALYSIS_MODES:
+        return jsonify({"error": f"Invalid master mode: {mode}"}), 400
+    if quality not in MASTER_QUALITY_MODES:
+        return jsonify({"error": f"Invalid quality mode: {quality}"}), 400
+
+    valid_ids = {x["id"] for x in master_strategy_catalog()}
+    if strategy is not None and strategy not in valid_ids:
+        return jsonify({"error": f"Invalid strategy: {strategy}"}), 400
+    if mode == "selected-strategy" and strategy is None:
+        return jsonify({"error": "selected-strategy requires a strategy."}), 400
+
+    _MASTER_CONFIG = {"mode": mode, "strategy": strategy, "quality_mode": quality}
+    return jsonify({
+        **_MASTER_CONFIG,
+        "modes": list(MASTER_ANALYSIS_MODES),
+        "quality_modes": list(MASTER_QUALITY_MODES),
+        "strategies": master_strategy_catalog(),
+    })
 
 @app.route("/api/live-prices")
 def api_live_prices():
