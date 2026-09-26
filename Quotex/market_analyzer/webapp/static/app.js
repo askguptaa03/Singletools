@@ -475,17 +475,24 @@ function fillSignalCard(card, data, opts = {}) {
 
 const REQUEST_TIMEOUT_MS = 20000;
 const MANUAL_REQUEST_TIMEOUT_MS = 60000;
+let _masterConfig = { mode: 'adaptive', strategy: null, quality_mode: 'balanced', strategies: [] };
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
-async function fetchSignal(asset, timeframe, timeoutMs = REQUEST_TIMEOUT_MS) {
+async function fetchSignal(asset, timeframe, timeoutMs = REQUEST_TIMEOUT_MS, masterOptions = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch('/api/signal', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ asset, timeframe }),
+      body: JSON.stringify({
+        asset,
+        timeframe,
+        master_mode: masterOptions.mode || _masterConfig.mode || 'adaptive',
+        master_strategy: masterOptions.strategy ?? _masterConfig.strategy ?? null,
+        quality_mode: masterOptions.quality_mode || _masterConfig.quality_mode || 'balanced',
+      }),
       signal: controller.signal,
     });
     const data = await res.json().catch(() => ({}));
@@ -507,8 +514,8 @@ async function fetchSignal(asset, timeframe, timeoutMs = REQUEST_TIMEOUT_MS) {
 
 let _requestChain = Promise.resolve();
 
-function enqueueSignalRequest(asset, timeframe, timeoutMs = REQUEST_TIMEOUT_MS) {
-  const run = _requestChain.then(() => fetchSignal(asset, timeframe, timeoutMs));
+function enqueueSignalRequest(asset, timeframe, timeoutMs = REQUEST_TIMEOUT_MS, masterOptions = {}) {
+  const run = _requestChain.then(() => fetchSignal(asset, timeframe, timeoutMs, masterOptions));
   _requestChain = run.then(() => undefined, () => undefined);
   return run;
 }
@@ -1183,6 +1190,88 @@ function selectManualAsset(sym) {
 
 let _manLoading = false;
 
+async function loadMasterConfig() {
+  try {
+    const r = await fetch('/api/master/config', { cache: 'no-store' });
+    const d = await r.json();
+    if (r.ok) {
+      _masterConfig = d;
+      const sel = $('man-master-strategy');
+      if (sel) {
+        sel.innerHTML = (_masterConfig.strategies || []).map(s =>
+          `<option value="${s.id}">${s.name}</option>`
+        ).join('');
+        if (_masterConfig.strategy) sel.value = _masterConfig.strategy;
+      }
+      if ($('man-master-mode')) $('man-master-mode').value = _masterConfig.mode || 'adaptive';
+      if ($('man-master-quality')) $('man-master-quality').value = _masterConfig.quality_mode || 'balanced';
+    }
+  } catch (_) {}
+}
+
+function masterOptionsFromUi() {
+  const mode = $('man-master-mode')?.value || _masterConfig.mode || 'adaptive';
+  const strategy = $('man-master-strategy')?.value || null;
+  const quality_mode = $('man-master-quality')?.value || _masterConfig.quality_mode || 'balanced';
+  return { mode, strategy: mode === 'selected-strategy' ? strategy : null, quality_mode };
+}
+
+async function syncMasterConfigFromUi() {
+  const options = masterOptionsFromUi();
+  try {
+    const r = await fetch('/api/master/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: options.mode, strategy: options.strategy, quality_mode: options.quality_mode }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok) _masterConfig = d;
+  } catch (_) {}
+  return options;
+}
+
+function renderMasterResult(data, container) {
+  const m = data.master_analysis;
+  if (!m || !container) return;
+  const chart = m.chart_reading || {};
+  const zones = chart.zones || {};
+  const liq = chart.liquidity || {};
+  const confs = m.confirmations || {};
+  const mandatory = Array.isArray(confs) ? confs : (confs.mandatory || []);
+  const optional = Array.isArray(confs) ? null : confs.optional_third;
+  const signal = m.signal === 'BUY' ? 'CALL' : m.signal === 'SELL' ? 'PUT' : 'WAIT';
+  const structure = chart.structure || '—';
+  const pattern = chart.pattern?.name || '—';
+  const zone = (zones.support != null || zones.resistance != null)
+    ? `S ${zones.support != null ? zones.support : '—'} · R ${zones.resistance != null ? zones.resistance : '—'}` : '—';
+  const liquidity = liq.sweep ? `Sweep → ${liq.direction || '—'}` : 'No confirmed sweep';
+  const why = Array.isArray(m.reasons) && m.reasons.length ? m.reasons.join(' · ') : '—';
+  const wait = m.wait_reason || '—';
+  const confirmations = mandatory.length ? mandatory.map((v, i) => `C${i + 1}: ${v ? 'PASS' : '—'}`).join(' · ') : '—';
+  const el = document.createElement('section');
+  el.className = 'glass-card';
+  el.style.marginTop = '12px';
+  el.innerHTML = `
+    <div class="panel-title" style="margin-bottom:10px;">Master Market Reading</div>
+    <div class="small-metrics-grid">
+      <div class="metric-card"><span class="k">Signal</span><span class="v">${signal}</span></div>
+      <div class="metric-card"><span class="k">Confidence Score</span><span class="v">${m.confidence_score ?? 0}</span></div>
+      <div class="metric-card"><span class="k">Strategy / Playbook</span><span class="v">${m.strategy_label || m.strategy || '—'}</span></div>
+      <div class="metric-card"><span class="k">Mode</span><span class="v">${m.mode || 'adaptive'}</span></div>
+      <div class="metric-card"><span class="k">Quality</span><span class="v">${m.quality_mode || 'balanced'}</span></div>
+      <div class="metric-card"><span class="k">Market Structure</span><span class="v">${structure}</span></div>
+      <div class="metric-card"><span class="k">Pattern</span><span class="v">${pattern}</span></div>
+      <div class="metric-card"><span class="k">S/R · Zone</span><span class="v">${zone}</span></div>
+      <div class="metric-card"><span class="k">Liquidity</span><span class="v">${liquidity}</span></div>
+    </div>
+    <p class="page-intro small" style="margin-bottom:4px;"><b>Mandatory confirmations:</b> ${confirmations}</p>
+    <p class="page-intro small" style="margin-bottom:4px;"><b>Optional 3rd confirmation:</b> ${optional == null ? '—' : optional ? 'PASS' : '—'}</p>
+    <p class="page-intro small" style="margin-bottom:4px;"><b>Why this signal?</b> ${why}</p>
+    ${signal === 'WAIT' ? `<p class="page-intro small" style="margin-bottom:0;"><b>WAIT reason:</b> ${wait}</p>` : ''}
+  `;
+  container.appendChild(el);
+}
+
 async function runManualAnalysis() {
   // Guard against duplicate clicks/taps while a request is already in progress.
   if (_manLoading || $('man-analyze-btn').disabled) return;
@@ -1194,6 +1283,7 @@ async function runManualAnalysis() {
   const asset = $('man-asset').value;
   const timeframe = $('man-timeframe').value;
   const expiry = $('man-expiry').value;
+  const masterOptions = await syncMasterConfigFromUi();
 
   // Step 5 — Live Asset Availability preflight. Only applies to OTC
   // symbols (the live-availability system's scope); non-OTC "LIVE" assets
@@ -1253,7 +1343,7 @@ async function runManualAnalysis() {
 
   let res;
   try {
-    res = await enqueueSignalRequest(asset, timeframe, MANUAL_REQUEST_TIMEOUT_MS);
+    res = await enqueueSignalRequest(asset, timeframe, MANUAL_REQUEST_TIMEOUT_MS, masterOptions);
   } finally {
     // Re-enable the Auto Scanner only after the manual request completes or fails.
     _scanPaused = false;
@@ -1297,6 +1387,7 @@ function renderManualResult(data, expiry) {
   const slot = $('man-result-slot');
   slot.innerHTML = '';
   slot.appendChild(card);
+  renderMasterResult(data, slot);
   $('man-placeholder').hidden = true;
   card.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
@@ -3479,6 +3570,7 @@ function initLearningPage() {
  * ──────────────────────────────────────────────────────────────────────────── */
 
 initAssetGrid('man-asset-grid', 'man-asset-search', 'man-asset');
+loadMasterConfig();
 loadSignalsToday();
 $('stat-assets').textContent = SCAN_LIST.length;
 syncAutoScanToggleUI();
