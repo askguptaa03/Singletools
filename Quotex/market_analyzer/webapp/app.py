@@ -36,6 +36,65 @@ for _p in (_MARKET_DIR, _QUOTEX_DIR):
 
 from flask import Flask, render_template, request, jsonify
 
+
+def _json_safe(value: Any) -> Any:
+    """Recursively convert analysis values into standard JSON-safe types.
+
+    The analysis stack uses NumPy/Pandas scalar values and timestamps in a few
+    nested diagnostic structures. Flask's JSON provider does not serialize all
+    of those types reliably, so the Manual Analyzer normalizes the final
+    response without changing any signal calculations.
+    """
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+
+    if isinstance(value, float):
+        # JSON has no representation for NaN/Infinity.  Treat those as an
+        # unavailable value rather than allowing response serialization to fail.
+        import math
+        return value if math.isfinite(value) else None
+
+    if isinstance(value, dict):
+        safe = {}
+        for key, item in value.items():
+            safe_key = _json_safe(key)
+            if not isinstance(safe_key, (str, int, float, bool)) and safe_key is not None:
+                safe_key = str(safe_key)
+            safe[safe_key] = _json_safe(item)
+        return safe
+
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+
+    # NumPy arrays and Pandas objects commonly expose tolist()/to_dict().
+    for method_name in ("tolist", "to_dict"):
+        method = getattr(value, method_name, None)
+        if callable(method):
+            try:
+                return _json_safe(method())
+            except Exception:
+                pass
+
+    # NumPy scalar types (np.float64, np.int64, np.bool_, etc.).
+    item_method = getattr(value, "item", None)
+    if callable(item_method):
+        try:
+            return _json_safe(item_method())
+        except Exception:
+            pass
+
+    # Pandas Timestamp / datetime-like values.
+    iso_method = getattr(value, "isoformat", None)
+    if callable(iso_method):
+        try:
+            return iso_method()
+        except Exception:
+            pass
+
+    # Last-resort normalization keeps an unexpected third-party scalar from
+    # turning an otherwise valid analysis into an HTTP 500 serialization error.
+    return str(value)
+
 import config as cfg
 from fetch_data import QuotexDataFetcher
 from indicators import calculate_all
@@ -1310,7 +1369,7 @@ def api_signal():
             result["asset_status"] = _run_bg(_get_live_asset_status(asset), timeout=10.0)
         except Exception:
             result["asset_status"] = "unknown"  # never guess/fabricate on failure
-    return jsonify(result)
+    return jsonify(_json_safe(result))
 
 
 
